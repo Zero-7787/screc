@@ -113,7 +113,7 @@ impl HlsDownloader {
         }
     }
 
-    /// 下载 HLS 流（统一循环，消除代码重复）
+    /// 下载 HLS 流（支持按时无缝切片，统一循环）
     pub async fn download_hls_stream<F>(
         &mut self,
         playlist_url: &str,
@@ -123,12 +123,27 @@ impl HlsDownloader {
     where
         F: Fn(&str) -> String,
     {
-        debug!("[{}] 开始 HLS 下载到: {:?}", self.username, output_path);
+        debug!("[{}] 开始 HLS 下载，基础路径: {:?}", self.username, output_path);
 
-        // 为原始 MP4 分片创建临时文件（fMP4），使用 BufWriter 减少系统调用
-        let temp_path = output_path.with_extension("tmp.mp4");
+        // --- 【新设参数：自定义单视频最大录制时长】 ---
+        let max_duration = tokio::time::Duration::from_secs(3600); // 3600秒 = 1小时，可自行修改
+        let mut part_index = 1;
+        let mut part_start_time = tokio::time::Instant::now();
+
+        // 辅助闭包：根据序号动态生成当前分段的临时路径和最终路径
+        let get_part_paths = |base_path: &Path, idx: usize| {
+            let stem = base_path.file_stem().unwrap_or_default().to_string_lossy();
+            let parent = base_path.parent().unwrap_or_else(|| Path::new(""));
+            let current_output = parent.join(format!("{}_part{}.mp4", stem, idx));
+            let current_temp = parent.join(format!("{}_part{}.ts", stem, idx)); // 这里保持你改好的 ts 临时格式
+            (current_temp, current_output)
+        };
+
+        // 初始化第一个分段的路径与文件
+        let (mut temp_path, mut current_output_path) = get_part_paths(output_path, part_index);
         let file = File::create(&temp_path).await?;
         let mut output_file = BufWriter::with_capacity(256 * 1024, file); // 256KB 缓冲
+        
         let mut has_downloaded_content = false;
         let mut consecutive_empty_playlists = 0u32;
         let mut consecutive_pending_retries = 0u32; // PendingRetry 连续计数器
@@ -164,10 +179,57 @@ impl HlsDownloader {
 
             match round_result {
                 Ok((RoundOutcome::DownloadedContent, _)) => {
-                    // 成功获取内容：重置所有计数器，立即继续下一轮
+                    // 成功获取内容：重置所有计数器
                     has_downloaded_content = true;
                     consecutive_empty_playlists = 0;
                     consecutive_pending_retries = 0;
+
+                    // --- 【核心逻辑：检查录制时长是否到达规定时间】 ---
+                    if part_start_time.elapsed() >= max_duration {
+                        info!(
+                            "[{}] 当前分段录制已满 {} 秒，正在无缝切换到下一分段...",
+                            self.username,
+                            max_duration.as_secs()
+                        );
+
+                        // 1. 强刷并关闭当前的临时文件缓冲区
+                        if let Err(e) = output_file.flush().await {
+                            error!("[{}] 刷新当前分段缓冲区失败: {}", self.username, e);
+                        }
+                        drop(output_file);
+
+                        // 2. 将当前已经录好的旧文件丢给 tokio 后台异步转换，绝不阻塞主录制循环
+                        let username_clone = self.username.clone();
+                        let old_temp = temp_path.clone();
+                        let old_output = current_output_path.clone();
+                        
+                        tokio::spawn(async move {
+                            debug!("[{}] 后台任务：正在将 Part {} 转换为 MP4...", username_clone, part_index);
+                            // 这里借用底层 ffmpeg 逻辑执行后台转换
+                            if let Err(e) = convert_ts_to_mp4_static(&username_clone, &old_temp, &old_output).await {
+                                error!("[{}] 后台 Part {} 视频转换失败: {}", username_clone, part_index, e);
+                                warn!("[{}] 原始数据已保留在: {:?}，可手动恢复", username_clone, old_temp);
+                            } else {
+                                info!("[{}] 后台 Part {} 视频转换成功完成: {:?}", username_clone, part_index, old_output);
+                                if let Err(e) = tokio::fs::remove_file(&old_temp).await {
+                                    error!("[{}] 后台清理临时文件失败: {}", username_clone, e);
+                                }
+                            }
+                        });
+
+                        // 3. 递增分段序号，立刻睁开眼睛创建新文件接续录制
+                        part_index += 1;
+                        let paths = get_part_paths(output_path, part_index);
+                        temp_path = paths.0;
+                        current_output_path = paths.1;
+
+                        let new_file = File::create(&temp_path).await?;
+                        output_file = BufWriter::with_capacity(256 * 1024, new_file);
+                        
+                        // 重置当前分段计时器
+                        part_start_time = tokio::time::Instant::now();
+                    }
+
                     continue;
                 }
                 Ok((RoundOutcome::NoNewSegments, target_duration)) => {
@@ -196,7 +258,6 @@ impl HlsDownloader {
                 }
                 Ok((RoundOutcome::PendingRetry, _)) => {
                     // 有分片但全部失败：不计入空轮计数，快速重试
-                    // 但连续 PendingRetry 过多说明 CDN 可能全面故障
                     consecutive_pending_retries += 1;
                     if consecutive_pending_retries >= MAX_CONSECUTIVE_PENDING_RETRIES {
                         warn!(
@@ -217,7 +278,7 @@ impl HlsDownloader {
                     }
                 }
                 Err(e) => {
-                    // 播放列表获取失败（网络错误、HTTP 错误）：计入空轮计数
+                    // 播放列表获取失败：计入空轮计数
                     error!("[{}] 下载轮次出错: {}", self.username, e);
                     consecutive_empty_playlists += 1;
                     if consecutive_empty_playlists >= MAX_EMPTY_PLAYLISTS {
@@ -233,35 +294,28 @@ impl HlsDownloader {
             }
         };
 
-        // 确保缓冲数据写入磁盘
+        // --- 【退出循环后：处理最后一个未完成的分段】 ---
         if let Err(e) = output_file.flush().await {
             error!("[{}] 刷新文件缓冲区失败: {}", self.username, e);
         }
         drop(output_file);
 
-        // 只有在实际下载了内容时才进行转换
         if has_downloaded_content {
-            debug!("[{}] 正在将录制内容转换为 MP4 格式...", self.username);
-            match self.convert_ts_to_mp4(&temp_path, output_path).await {
+            debug!("[{}] 正在转换最后一个录制分段 (Part {})...", self.username, part_index);
+            match convert_ts_to_mp4_static(&self.username, &temp_path, &current_output_path).await {
                 Ok(()) => {
-                    info!("[{}] 视频转换成功完成", self.username);
-                    // 转换成功，清理临时文件
+                    info!("[{}] 最后一个分段转换成功完成", self.username);
                     if let Err(e) = tokio::fs::remove_file(&temp_path).await {
                         error!("[{}] 清理临时文件失败: {}", self.username, e);
                     }
                 }
                 Err(e) => {
-                    error!("[{}] 视频转换失败: {}", self.username, e);
-                    // 保留临时文件以便手动恢复
-                    warn!(
-                        "[{}] 原始数据已保留在: {:?}，可手动用 ffmpeg 修复",
-                        self.username, temp_path
-                    );
+                    error!("[{}] 最后一个分段转换失败: {}", self.username, e);
+                    warn!("[{}] 原始数据已保留在: {:?}，可手动用 ffmpeg 修复", self.username, temp_path);
                 }
             }
         } else {
             debug!("[{}] 没有下载任何内容，跳过视频转换", self.username);
-            // 清理空临时文件
             if let Err(e) = tokio::fs::remove_file(&temp_path).await {
                 debug!("[{}] 清理空临时文件失败: {}", self.username, e);
             }
@@ -269,7 +323,6 @@ impl HlsDownloader {
 
         download_result
     }
-
     /// 下载播放列表分片（单线程顺序下载）
     async fn download_playlist_segments<F>(
         &mut self,
@@ -652,76 +705,44 @@ impl HlsDownloader {
         Ok(bytes.to_vec())
     }
 
-    /// 使用 FFmpeg 将 fMP4 转换为 MP4（异步，不阻塞 tokio 工作线程）
-    async fn convert_ts_to_mp4(&self, input_path: &Path, output_path: &Path) -> Result<()> {
-        use std::process::Command;
+    /// 静态 FFmpeg 转换函数，用于脱离 self 在后台异步线程运行
+async fn convert_ts_to_mp4_static(username: &str, input_path: &Path, output_path: &Path) -> Result<()> {
+    use std::process::Command;
 
-        info!("[{}] 使用 FFmpeg 将 fMP4 转换为 MP4...", self.username);
+    let mut std_cmd = Command::new("ffmpeg");
+    std_cmd
+        .arg("-fflags")
+        .arg("+genpts+igndts")
+        .arg("-i")
+        .arg(input_path)
+        .arg("-c:a")
+        .arg("copy")
+        .arg("-c:v")
+        .arg("copy")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg("-y")
+        .arg(output_path);
 
-        let mut std_cmd = Command::new("ffmpeg");
-        std_cmd
-            .arg("-fflags")
-            .arg("+genpts+igndts")
-            .arg("-i")
-            .arg(input_path)
-            .arg("-c:a")
-            .arg("copy")
-            .arg("-c:v")
-            .arg("copy")
-            .arg("-movflags")
-            .arg("+faststart")
-            .arg("-y")
-            .arg(output_path);
-
-        // Windows GUI 模式下隐藏 ffmpeg 控制台窗口，并使其脱离父进程生命周期
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // CREATE_NO_WINDOW | DETACHED_PROCESS
-            std_cmd.creation_flags(0x08000000 | 0x00000008);
-        }
-
-        let mut cmd = tokio::process::Command::from(std_cmd);
-
-        let output = cmd.output().await.map_err(|e| {
-            anyhow!(
-                "运行 FFmpeg 失败: {}。请确保 FFmpeg 已安装并在 PATH 中。",
-                e
-            )
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("FFmpeg 转换失败: {}", stderr));
-        }
-
-        info!("[{}] 录制已保存到: {:?}", self.username, output_path);
-        Ok(())
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW | DETACHED_PROCESS
+        std_cmd.creation_flags(0x08000000 | 0x00000008);
     }
 
-    /// 提取初始化分片 URL
-    fn extract_init_segment(&self, content: &str, playlist_url: &str) -> Result<Option<String>> {
-        // 查找 #EXT-X-MAP:URI="..." 行
-        content
-            .lines()
-            .find(|line| line.starts_with("#EXT-X-MAP:URI="))
-            .and_then(|line| {
-                line.find("URI=\"")
-                    .map(|start| start + 5) // 跳过 "URI=""
-                    .and_then(|start| line[start..].find('"').map(|end| &line[start..start + end]))
-            })
-            .map(|init_uri| {
-                // 如需要，将相对 URI 转换为绝对 URI
-                let init_url = if init_uri.starts_with("http") {
-                    init_uri.to_string()
-                } else {
-                    let base_url = Url::parse(playlist_url)?;
-                    base_url.join(init_uri)?.to_string()
-                };
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    let output = cmd.output().await.map_err(|e| {
+        anyhow!(
+            "运行 FFmpeg 失败: {}。请确保 FFmpeg 已安装并在 PATH 中。",
+            e
+        )
+    })?;
 
-                debug!("[{}] 发现初始化分片: {}", self.username, init_url);
-                Ok(init_url)
-            })
-            .transpose()
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("FFmpeg 转换失败: {}", stderr));
     }
+
+    Ok(())
 }
