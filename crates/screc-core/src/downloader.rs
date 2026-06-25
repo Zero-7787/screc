@@ -704,7 +704,7 @@ impl HlsDownloader {
 
         Ok(bytes.to_vec())
     }
-
+}
     /// 静态 FFmpeg 转换函数，用于脱离 self 在后台异步线程运行
 async fn convert_ts_to_mp4_static(username: &str, input_path: &Path, output_path: &Path) -> Result<()> {
     use std::process::Command;
