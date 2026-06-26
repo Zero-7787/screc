@@ -134,20 +134,19 @@ impl HlsDownloader {
         let get_part_ts_path = |base_path: &Path, idx: usize| {
             let stem = base_path.file_stem().unwrap_or_default().to_string_lossy();
             let parent = base_path.parent().unwrap_or_else(|| Path::new(""));
-            // 最终直接产出标准的 .ts 文件
             parent.join(format!("{}_part{}.ts", stem, idx))
         };
 
-        // 辅助函数：启动一个实时将标准输入(fMP4)封装为标准输出(MPEG-TS)的 FFmpeg 子进程
+        // 辅助函数：启动实时将标准输入转换为标准 MPEG-TS 写入文件的 FFmpeg 进程
         let spawn_ffmpeg_muxer = |ts_path: &Path| -> Result<(tokio::process::Child, tokio::process::ChildStdin)> {
             use std::process::Stdio;
             let mut std_cmd = std::process::Command::new("ffmpeg");
             std_cmd
-                .arg("-loglevel").arg("error")  // 只打印错误信息
+                .arg("-loglevel").arg("error")
                 .arg("-fflags").arg("+genpts+igndts")
-                .arg("-i").arg("pipe:0")        // 从标准输入（管道）读取接到的分片数据
-                .arg("-c").arg("copy")          // 仅复制流，不重新编码，CPU 占用极低
-                .arg("-f").arg("mpegts")        // 强制输出格式为真正的 MPEG-TS 流
+                .arg("-i").arg("pipe:0") // 从标准输入读取
+                .arg("-c").arg("copy")   // 仅做封装，无需编解码
+                .arg("-f").arg("mpegts") // 强制定型为 MPEG-TS
                 .arg("-y")
                 .arg(ts_path);
 
@@ -158,7 +157,7 @@ impl HlsDownloader {
             }
 
             let mut cmd = tokio::process::Command::from(std_cmd);
-            cmd.stdin(Stdio::piped()); // 开启输入管道
+            cmd.stdin(Stdio::piped());
 
             let mut child = cmd.spawn().map_err(|e| anyhow!("无法启动实时 FFmpeg 转换器: {}", e))?;
             let stdin = child.stdin.take().ok_or_else(|| anyhow!("无法打开 FFmpeg 写入管道"))?;
@@ -168,7 +167,6 @@ impl HlsDownloader {
         // 初始化第一个分段的真正的 TS 文件和 FFmpeg 管道
         let mut current_ts_path = get_part_ts_path(output_path, part_index);
         let (mut ffmpeg_child, ffmpeg_stdin) = spawn_ffmpeg_muxer(&current_ts_path)?;
-        // 用 BufWriter 包裹管道，减少小数据块高频写入的系统调用开销
         let mut output_file = BufWriter::with_capacity(256 * 1024, ffmpeg_stdin);
         
         let mut has_downloaded_content = false;
@@ -209,10 +207,9 @@ impl HlsDownloader {
                             error!("[{}] 刷新 FFmpeg 管道失败: {}", self.username, e);
                         }
                         drop(output_file);
-                        // 等待当前的 FFmpeg 干净地把最后的尾巴写入完毕
                         let _ = ffmpeg_child.wait().await;
 
-                        // 2. 递增分段序号，立刻睁开眼睛创建下一个真 TS 文件的 FFmpeg 管道
+                        // 2. 递增分段序号，立刻接续下个管道
                         part_index += 1;
                         current_ts_path = get_part_ts_path(output_path, part_index);
                         
@@ -220,7 +217,6 @@ impl HlsDownloader {
                         ffmpeg_child = next_child;
                         output_file = BufWriter::with_capacity(256 * 1024, next_stdin);
                         
-                        // 重置计时器
                         part_start_time = tokio::time::Instant::now();
                     }
                     continue;
@@ -267,23 +263,23 @@ impl HlsDownloader {
         let _ = ffmpeg_child.wait().await;
 
         if has_downloaded_content {
-            info!("[{}] 录制成功完成，所有分段已实时转换为真正的 MPEG-TS 流！", self.username);
+            info!("[{}] 所有分段已实时封装为纯正的 MPEG-TS 流！", self.username);
         } else {
-            // 如果什么都没下载到，删掉空文件
             let _ = tokio::fs::remove_file(&current_ts_path).await;
         }
 
         download_result
     }
     /// 下载播放列表分片（单线程顺序下载）
-    async fn download_playlist_segments<F>(
+    async fn download_playlist_segments<F, W>(
         &mut self,
         playlist_url: &str,
-        output_file: &mut BufWriter<File>,
+        output_file: &mut BufWriter<W>,
         m3u_processor: Option<&F>,
     ) -> Result<(RoundOutcome, u64)>
     where
         F: Fn(&str) -> String,
+        W: tokio::io::AsyncWrite + Unpin, // 让它能够支持任何异步写入目标（文件/管道均可）
     {
         debug!("[{}] 获取播放列表: {}", self.username, playlist_url);
 
