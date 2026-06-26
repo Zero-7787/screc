@@ -303,27 +303,29 @@ impl HlsDownloader {
         let mut init_just_downloaded = false; 
 
         for line in content.lines() {
-            if let Some(duration_str) = line.strip_prefix("#EXT-X-TARGETDURATION:")
-                && let Ok(duration) = duration_str.parse::<u64>()
-            {
-                target_duration = duration;
-                break;
+            if line.starts_with("#EXT-X-TARGETDURATION:") {
+                if let Some(duration_str) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
+                    if let Ok(duration) = duration_str.parse::<u64>() {
+                        target_duration = duration;
+                        break;
+                    }
+                }
             }
         }
 
-        if !self.init_segment_downloaded
-            && let Some(init_url) = self.extract_init_segment(&content, playlist_url)?
-        {
-            debug!("[{}] 下载初始化分片: {}", self.username, init_url);
-            match self.download_with_retry(&init_url).await {
-                Ok(data) => {
-                    output_file.write_all(&data).await?;
-                    self.init_segment_downloaded = true;
-                    init_just_downloaded = true;
-                }
-                Err(e) => {
-                    error!("[{}] 初始化分片下载失败: {}", self.username, e);
-                    init_failed = true;
+        if !self.init_segment_downloaded {
+            if let Some(init_url) = self.extract_init_segment(&content, playlist_url)? {
+                debug!("[{}] 下载初始化分片: {}", self.username, init_url);
+                match self.download_with_retry(&init_url).await {
+                    Ok(data) => {
+                        output_file.write_all(&data).await?;
+                        self.init_segment_downloaded = true;
+                        init_just_downloaded = true;
+                    }
+                    Err(e) => {
+                        error!("[{}] 初始化分片下载失败: {}", self.username, e);
+                        init_failed = true;
+                    }
                 }
             }
         }
@@ -500,8 +502,10 @@ impl HlsDownloader {
             return Err(anyhow!("分片数据过小: {} 字节", actual_len));
         }
 
-        if let Some(expected) = expected_len && actual_len != expected {
-            return Err(anyhow!("分片数据不完整: 期望 {} 字节，实际 {} 字节", expected, actual_len));
+        if let Some(expected) = expected_len {
+            if actual_len != expected {
+                return Err(anyhow!("分片数据不完整: 期望 {} 字节，实际 {} 字节", expected, actual_len));
+            }
         }
 
         Ok(bytes.to_vec())
