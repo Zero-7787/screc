@@ -109,7 +109,7 @@ impl HlsDownloader {
         }
     }
 
-    /// 下载 HLS 流并实时转换为真正的 MPEG-TS 流（支持按时无缝切片）
+    /// 下载 HLS 流（统一循环，录制完成后自动触发转码）
     pub async fn download_hls_stream<F>(
         &mut self,
         playlist_url: &str,
@@ -119,56 +119,17 @@ impl HlsDownloader {
     where
         F: Fn(&str) -> String,
     {
-        debug!("[{}] 开始 HLS 下载，基础路径: {:?}", self.username, output_path);
+        debug!("[{}] 开始 HLS 下载到: {:?}", self.username, output_path);
 
-        // --- 【自定义单视频最大录制时长】 ---
-        let max_duration = tokio::time::Duration::from_secs(3600); // 3600秒 = 1小时
-        let mut part_index = 1;
-        let mut part_start_time = tokio::time::Instant::now();
-
-        // 辅助闭包：生成当前分段真正的 TS 路径
-        let get_part_ts_path = |base_path: &Path, idx: usize| {
-            let stem = base_path.file_stem().unwrap_or_default().to_string_lossy();
-            let parent = base_path.parent().unwrap_or_else(|| Path::new(""));
-            parent.join(format!("{}_part{}.ts", stem, idx))
-        };
-
-        // 辅助函数：启动实时将标准输入转换为标准 MPEG-TS 写入文件的 FFmpeg 进程
-        let spawn_ffmpeg_muxer = |ts_path: &Path| -> Result<(tokio::process::Child, tokio::process::ChildStdin)> {
-            use std::process::Stdio;
-            let mut std_cmd = std::process::Command::new("ffmpeg");
-            std_cmd
-                .arg("-loglevel").arg("error")
-                .arg("-fflags").arg("+genpts+igndts")
-                .arg("-i").arg("pipe:0") 
-                .arg("-c").arg("copy")   
-                .arg("-f").arg("mpegts") 
-                .arg("-y")
-                .arg(ts_path);
-
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                std_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-            }
-
-            let mut cmd = tokio::process::Command::from(std_cmd);
-            cmd.stdin(Stdio::piped());
-
-            let mut child = cmd.spawn().map_err(|e| anyhow!("无法启动实时 FFmpeg 转换器: {}", e))?;
-            let stdin = child.stdin.take().ok_or_else(|| anyhow!("无法打开 FFmpeg 写入管道"))?;
-            Ok((child, stdin))
-        };
-
-        // 初始化第一个分段的真正的 TS 文件和 FFmpeg 管道
-        let mut current_ts_path = get_part_ts_path(output_path, part_index);
-        let (mut ffmpeg_child, ffmpeg_stdin) = spawn_ffmpeg_muxer(&current_ts_path)?;
-        let mut output_file = BufWriter::with_capacity(256 * 1024, ffmpeg_stdin);
-        
+        // 为原始 MP4/TS 分片创建临时文件，使用 BufWriter 减少系统调用
+        let temp_path = output_path.with_extension("tmp.mp4");
+        let file = File::create(&temp_path).await?;
+        let mut output_file = BufWriter::with_capacity(256 * 1024, file); 
         let mut has_downloaded_content = false;
         let mut consecutive_empty_playlists = 0u32;
-        let mut consecutive_pending_retries = 0u32;
+        let mut consecutive_pending_retries = 0u32; 
 
+        // 计算动态等待时间的辅助函数
         let calc_wait_time = |target_duration: u64| -> u64 {
             if target_duration <= 2 { 1 } else if target_duration <= 6 { target_duration / 2 } else { 3 }
         };
@@ -193,32 +154,13 @@ impl HlsDownloader {
                     has_downloaded_content = true;
                     consecutive_empty_playlists = 0;
                     consecutive_pending_retries = 0;
-
-                    if part_start_time.elapsed() >= max_duration {
-                        info!("[{}] 当前分段已满 {} 秒，正在无缝切换到下一 TS 分段...", self.username, max_duration.as_secs());
-
-                        if let Err(e) = output_file.flush().await {
-                            error!("[{}] 刷新 FFmpeg 管道失败: {}", self.username, e);
-                        }
-                        drop(output_file);
-                        let _ = ffmpeg_child.wait().await;
-
-                        part_index += 1;
-                        current_ts_path = get_part_ts_path(output_path, part_index);
-                        
-                        let (next_child, next_stdin) = spawn_ffmpeg_muxer(&current_ts_path)?;
-                        ffmpeg_child = next_child;
-                        output_file = BufWriter::with_capacity(256 * 1024, next_stdin);
-                        
-                        part_start_time = tokio::time::Instant::now();
-                    }
                     continue;
                 }
                 Ok((RoundOutcome::NoNewSegments, target_duration)) => {
                     consecutive_pending_retries = 0;
                     consecutive_empty_playlists += 1;
                     if consecutive_empty_playlists >= MAX_EMPTY_PLAYLISTS {
-                        info!("[{}] 直播可能已结束", self.username);
+                        info!("[{}] 连续 {} 次未发现新分片，直播可能已结束", self.username, MAX_EMPTY_PLAYLISTS);
                         break 'main Ok(());
                     }
                     let wait_time = calc_wait_time(target_duration);
@@ -248,44 +190,50 @@ impl HlsDownloader {
             }
         };
 
+        // 确保缓冲数据写入磁盘，并必须提前关闭释放临时文件锁
         if let Err(e) = output_file.flush().await {
-            error!("[{}] 最终刷新 FFmpeg 管道失败: {}", self.username, e);
+            error!("[{}] 刷新文件缓冲区失败: {}", self.username, e);
         }
-        drop(output_file);
-        let _ = ffmpeg_child.wait().await;
+        drop(output_file); 
 
+        // 【确保触发点】：实际拉到内容后，立即调用 FFmpeg 进行自动无损转码封装
         if has_downloaded_content {
-            info!("[{}] 所有分段已实时封装为纯正的 MPEG-TS 流！", self.username);
+            debug!("[{}] 正在将录制内容转换为标准的 MP4 格式...", self.username);
+            match self.convert_ts_to_mp4(&temp_path, output_path).await {
+                Ok(()) => {
+                    info!("[{}] 视频转换成功完成，录制已保存至: {:?}", self.username, output_path);
+                    if let Err(e) = tokio::fs::remove_file(&temp_path).await {
+                        error!("[{}] 清理临时文件失败: {}", self.username, e);
+                    }
+                }
+                Err(e) => {
+                    error!("[{}] 视频转换失败: {}", self.username, e);
+                    warn!("[{}] 原始数据已保留在: {:?}，可手动用 ffmpeg 修复", self.username, temp_path);
+                }
+            }
         } else {
-            let _ = tokio::fs::remove_file(&current_ts_path).await;
+            debug!("[{}] 没有下载任何内容，跳过视频转换", self.username);
+            let _ = tokio::fs::remove_file(&temp_path).await;
         }
 
         download_result
     }
 
-    /// 下载播放列表分片（泛型 W 支持任意异步写入目标）
-    async fn download_playlist_segments<F, W>(
+    /// 下载播放列表分片
+    async fn download_playlist_segments<F>(
         &mut self,
         playlist_url: &str,
-        output_file: &mut BufWriter<W>,
+        output_file: &mut BufWriter<File>,
         m3u_processor: Option<&F>,
     ) -> Result<(RoundOutcome, u64)>
     where
         F: Fn(&str) -> String,
-        W: tokio::io::AsyncWrite + Unpin,
     {
-        debug!("[{}] 获取播放列表: {}", self.username, playlist_url);
-
         let response = self
             .client
             .get(playlist_url)
             .header("Accept", "*/*")
-            .header("Accept-Language", "en-US,en;q=0.5")
-            .header("DNT", "1")
             .header("Connection", "keep-alive")
-            .header("Sec-Fetch-Dest", "empty")
-            .header("Sec-Fetch-Mode", "cors")
-            .header("Sec-Fetch-Site", "cross-site")
             .send()
             .await?;
         if !response.status().is_success() {
@@ -303,12 +251,10 @@ impl HlsDownloader {
         let mut init_just_downloaded = false; 
 
         for line in content.lines() {
-            if line.starts_with("#EXT-X-TARGETDURATION:") {
-                if let Some(duration_str) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
-                    if let Ok(duration) = duration_str.parse::<u64>() {
-                        target_duration = duration;
-                        break;
-                    }
+            if let Some(duration_str) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
+                if let Ok(duration) = duration_str.parse::<u64>() {
+                    target_duration = duration;
+                    break;
                 }
             }
         }
@@ -471,12 +417,6 @@ impl HlsDownloader {
             .client
             .get(segment_url)
             .header("Accept", "*/*")
-            .header("Accept-Language", "en-US,en;q=0.5")
-            .header("DNT", "1")
-            .header("Connection", "keep-alive")
-            .header("Sec-Fetch-Dest", "empty")
-            .header("Sec-Fetch-Mode", "cors")
-            .header("Sec-Fetch-Site", "cross-site")
             .send()
             .await?;
 
@@ -486,15 +426,9 @@ impl HlsDownloader {
             reqwest::StatusCode::NOT_FOUND => return Ok(Vec::new()),
             reqwest::StatusCode::FORBIDDEN => return Ok(Vec::new()),
             reqwest::StatusCode::TOO_MANY_REQUESTS => return Err(anyhow!("请求过于频繁 (429)，将重试")),
-            status => return Err(anyhow!("下载分片失败: {} {}", status.as_u16(), status.canonical_reason().unwrap_or("未知"))),
+            status => return Err(anyhow!("下载分片失败: {}", status.as_u16())),
         }
 
-        let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
-        if content_type.to_lowercase().contains("text/html") {
-            return Err(anyhow!("分片返回了 HTML 而非视频数据"));
-        }
-
-        let expected_len = response.headers().get(reqwest::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<usize>().ok());
         let bytes = response.bytes().await?;
         let actual_len = bytes.len();
 
@@ -502,13 +436,45 @@ impl HlsDownloader {
             return Err(anyhow!("分片数据过小: {} 字节", actual_len));
         }
 
-        if let Some(expected) = expected_len {
-            if actual_len != expected {
-                return Err(anyhow!("分片数据不完整: 期望 {} 字节，实际 {} 字节", expected, actual_len));
-            }
+        Ok(bytes.to_vec())
+    }
+
+    /// 使用 FFmpeg 将 fMP4/TS 转换为 MP4
+    async fn convert_ts_to_mp4(&self, input_path: &Path, output_path: &Path) -> Result<()> {
+        use std::process::Command;
+
+        let mut std_cmd = Command::new("ffmpeg");
+        std_cmd
+            .arg("-fflags")
+            .arg("+genpts+igndts")
+            .arg("-i")
+            .arg(input_path)
+            .arg("-c:a")
+            .arg("copy")
+            .arg("-c:v")
+            .arg("copy")
+            .arg("-movflags")
+            .arg("+faststart")
+            .arg("-y")
+            .arg(output_path);
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            std_cmd.creation_flags(0x08000000 | 0x00000008);
         }
 
-        Ok(bytes.to_vec())
+        let mut cmd = tokio::process::Command::from(std_cmd);
+        let output = cmd.output().await.map_err(|e| {
+            anyhow!("运行 FFmpeg 失败: {}。请确保 FFmpeg 已安装并在 PATH 中。", e)
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("FFmpeg 转换失败: {}", stderr));
+        }
+
+        Ok(())
     }
 
     /// 提取初始化分片 URL
@@ -519,7 +485,7 @@ impl HlsDownloader {
             .and_then(|line| {
                 line.find("URI=\"")
                     .map(|start| start + 5)
-                    .and_then(|start| line[start..].find('\"').map(|end| &line[start..start + end]))
+                    .and_then(|start| line[start..].find('"').map(|end| &line[start..start + end]))
             })
             .map(|init_uri| {
                 let init_url = if init_uri.starts_with("http") {
