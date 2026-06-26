@@ -113,7 +113,7 @@ impl HlsDownloader {
         }
     }
 
-    /// 下载 HLS 流（支持按时无缝切片，统一循环）
+    /// 下载 HLS 流并实时转换为真正的 MPEG-TS 流（支持按时无缝切片）
     pub async fn download_hls_stream<F>(
         &mut self,
         playlist_url: &str,
@@ -125,45 +125,63 @@ impl HlsDownloader {
     {
         debug!("[{}] 开始 HLS 下载，基础路径: {:?}", self.username, output_path);
 
-        // --- 【新设参数：自定义单视频最大录制时长】 ---
-        let max_duration = tokio::time::Duration::from_secs(3600); // 3600秒 = 1小时，可自行修改
+        // --- 【自定义单视频最大录制时长】 ---
+        let max_duration = tokio::time::Duration::from_secs(3600); // 3600秒 = 1小时
         let mut part_index = 1;
         let mut part_start_time = tokio::time::Instant::now();
 
-        // 辅助闭包：根据序号动态生成当前分段的临时路径和最终路径
-        let get_part_paths = |base_path: &Path, idx: usize| {
+        // 辅助闭包：生成当前分段真正的 TS 路径
+        let get_part_ts_path = |base_path: &Path, idx: usize| {
             let stem = base_path.file_stem().unwrap_or_default().to_string_lossy();
             let parent = base_path.parent().unwrap_or_else(|| Path::new(""));
-            let current_output = parent.join(format!("{}_part{}.mp4", stem, idx));
-            let current_temp = parent.join(format!("{}_part{}.ts", stem, idx)); // 这里保持你改好的 ts 临时格式
-            (current_temp, current_output)
+            // 最终直接产出标准的 .ts 文件
+            parent.join(format!("{}_part{}.ts", stem, idx))
         };
 
-        // 初始化第一个分段的路径与文件
-        let (mut temp_path, mut current_output_path) = get_part_paths(output_path, part_index);
-        let file = File::create(&temp_path).await?;
-        let mut output_file = BufWriter::with_capacity(256 * 1024, file); // 256KB 缓冲
+        // 辅助函数：启动一个实时将标准输入(fMP4)封装为标准输出(MPEG-TS)的 FFmpeg 子进程
+        let spawn_ffmpeg_muxer = |ts_path: &Path| -> Result<(tokio::process::Child, tokio::process::ChildStdin)> {
+            use std::process::Stdio;
+            let mut std_cmd = std::process::Command::new("ffmpeg");
+            std_cmd
+                .arg("-loglevel").arg("error")  // 只打印错误信息
+                .arg("-fflags").arg("+genpts+igndts")
+                .arg("-i").arg("pipe:0")        // 从标准输入（管道）读取接到的分片数据
+                .arg("-c").arg("copy")          // 仅复制流，不重新编码，CPU 占用极低
+                .arg("-f").arg("mpegts")        // 强制输出格式为真正的 MPEG-TS 流
+                .arg("-y")
+                .arg(ts_path);
+
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                std_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+
+            let mut cmd = tokio::process::Command::from(std_cmd);
+            cmd.stdin(Stdio::piped()); // 开启输入管道
+
+            let mut child = cmd.spawn().map_err(|e| anyhow!("无法启动实时 FFmpeg 转换器: {}", e))?;
+            let stdin = child.stdin.take().ok_or_else(|| anyhow!("无法打开 FFmpeg 写入管道"))?;
+            Ok((child, stdin))
+        };
+
+        // 初始化第一个分段的真正的 TS 文件和 FFmpeg 管道
+        let mut current_ts_path = get_part_ts_path(output_path, part_index);
+        let (mut ffmpeg_child, ffmpeg_stdin) = spawn_ffmpeg_muxer(&current_ts_path)?;
+        // 用 BufWriter 包裹管道，减少小数据块高频写入的系统调用开销
+        let mut output_file = BufWriter::with_capacity(256 * 1024, ffmpeg_stdin);
         
         let mut has_downloaded_content = false;
         let mut consecutive_empty_playlists = 0u32;
-        let mut consecutive_pending_retries = 0u32; // PendingRetry 连续计数器
+        let mut consecutive_pending_retries = 0u32;
 
-        // 计算动态等待时间的辅助函数
         let calc_wait_time = |target_duration: u64| -> u64 {
-            if target_duration <= 2 {
-                1
-            } else if target_duration <= 6 {
-                target_duration / 2
-            } else {
-                3
-            }
+            if target_duration <= 2 { 1 } else if target_duration <= 6 { target_duration / 2 } else { 3 }
         };
 
-        // 统一循环：通过 Option<&mut broadcast::Receiver> 处理有无 shutdown 的情况
         let mut shutdown_rx = self.shutdown_rx.as_mut().map(|rx| rx.resubscribe());
 
         let download_result = 'main: loop {
-            // 根据是否有 shutdown_rx 选择不同的等待方式
             let round_result = if let Some(ref mut rx) = shutdown_rx {
                 tokio::select! {
                     r = self.download_playlist_segments(playlist_url, &mut output_file, m3u_processor) => r,
@@ -173,152 +191,86 @@ impl HlsDownloader {
                     }
                 }
             } else {
-                self.download_playlist_segments(playlist_url, &mut output_file, m3u_processor)
-                    .await
+                self.download_playlist_segments(playlist_url, &mut output_file, m3u_processor).await
             };
 
             match round_result {
                 Ok((RoundOutcome::DownloadedContent, _)) => {
-                    // 成功获取内容：重置所有计数器
                     has_downloaded_content = true;
                     consecutive_empty_playlists = 0;
                     consecutive_pending_retries = 0;
 
-                    // --- 【核心逻辑：检查录制时长是否到达规定时间】 ---
+                    // --- 【检查是否到达切片时间】 ---
                     if part_start_time.elapsed() >= max_duration {
-                        info!(
-                            "[{}] 当前分段录制已满 {} 秒，正在无缝切换到下一分段...",
-                            self.username,
-                            max_duration.as_secs()
-                        );
+                        info!("[{}] 当前分段已满 {} 秒，正在无缝切换到下一 TS 分段...", self.username, max_duration.as_secs());
 
-                        // 1. 强刷并关闭当前的临时文件缓冲区
+                        // 1. 强刷并关闭当前的 FFmpeg 输入管道
                         if let Err(e) = output_file.flush().await {
-                            error!("[{}] 刷新当前分段缓冲区失败: {}", self.username, e);
+                            error!("[{}] 刷新 FFmpeg 管道失败: {}", self.username, e);
                         }
                         drop(output_file);
+                        // 等待当前的 FFmpeg 干净地把最后的尾巴写入完毕
+                        let _ = ffmpeg_child.wait().await;
 
-                        // 2. 将当前已经录好的旧文件丢给 tokio 后台异步转换，绝不阻塞主录制循环
-                        let username_clone = self.username.clone();
-                        let old_temp = temp_path.clone();
-                        let old_output = current_output_path.clone();
-                        
-                        tokio::spawn(async move {
-                            debug!("[{}] 后台任务：正在将 Part {} 转换为 MP4...", username_clone, part_index);
-                            // 这里借用底层 ffmpeg 逻辑执行后台转换
-                            if let Err(e) = convert_ts_to_mp4_static(&username_clone, &old_temp, &old_output).await {
-                                error!("[{}] 后台 Part {} 视频转换失败: {}", username_clone, part_index, e);
-                                warn!("[{}] 原始数据已保留在: {:?}，可手动恢复", username_clone, old_temp);
-                            } else {
-                                info!("[{}] 后台 Part {} 视频转换成功完成: {:?}", username_clone, part_index, old_output);
-                                if let Err(e) = tokio::fs::remove_file(&old_temp).await {
-                                    error!("[{}] 后台清理临时文件失败: {}", username_clone, e);
-                                }
-                            }
-                        });
-
-                        // 3. 递增分段序号，立刻睁开眼睛创建新文件接续录制
+                        // 2. 递增分段序号，立刻睁开眼睛创建下一个真 TS 文件的 FFmpeg 管道
                         part_index += 1;
-                        let paths = get_part_paths(output_path, part_index);
-                        temp_path = paths.0;
-                        current_output_path = paths.1;
-
-                        let new_file = File::create(&temp_path).await?;
-                        output_file = BufWriter::with_capacity(256 * 1024, new_file);
+                        current_ts_path = get_part_ts_path(output_path, part_index);
                         
-                        // 重置当前分段计时器
+                        let (next_child, next_stdin) = spawn_ffmpeg_muxer(&current_ts_path)?;
+                        ffmpeg_child = next_child;
+                        output_file = BufWriter::with_capacity(256 * 1024, next_stdin);
+                        
+                        // 重置计时器
                         part_start_time = tokio::time::Instant::now();
                     }
-
                     continue;
                 }
                 Ok((RoundOutcome::NoNewSegments, target_duration)) => {
-                    // 真没有新分片：计入空轮计数，重置 PendingRetry 计数
                     consecutive_pending_retries = 0;
                     consecutive_empty_playlists += 1;
-                    debug!(
-                        "[{}] 播放列表中没有新分片 ({}/{})",
-                        self.username, consecutive_empty_playlists, MAX_EMPTY_PLAYLISTS
-                    );
                     if consecutive_empty_playlists >= MAX_EMPTY_PLAYLISTS {
-                        info!(
-                            "[{}] 连续 {} 次未发现新分片，直播可能已结束",
-                            self.username, MAX_EMPTY_PLAYLISTS
-                        );
+                        info!("[{}] 直播可能已结束", self.username);
                         break 'main Ok(());
                     }
                     let wait_time = calc_wait_time(target_duration);
-                    debug!("[{}] 等待 {} 秒后重新检查", self.username, wait_time);
-                    if self
-                        .interruptible_sleep(tokio::time::Duration::from_secs(wait_time))
-                        .await
-                    {
+                    if self.interruptible_sleep(tokio::time::Duration::from_secs(wait_time)).await {
                         break 'main Ok(());
                     }
                 }
                 Ok((RoundOutcome::PendingRetry, _)) => {
-                    // 有分片但全部失败：不计入空轮计数，快速重试
                     consecutive_pending_retries += 1;
                     if consecutive_pending_retries >= MAX_CONSECUTIVE_PENDING_RETRIES {
-                        warn!(
-                            "[{}] 连续 {} 轮分片下载失败，CDN 可能不可用，停止下载",
-                            self.username, MAX_CONSECUTIVE_PENDING_RETRIES
-                        );
                         break 'main Ok(());
                     }
-                    debug!(
-                        "[{}] 分片下载暂时失败 (连续第 {} 轮)，1秒后重试",
-                        self.username, consecutive_pending_retries
-                    );
-                    if self
-                        .interruptible_sleep(tokio::time::Duration::from_secs(1))
-                        .await
-                    {
+                    if self.interruptible_sleep(tokio::time::Duration::from_secs(1)).await {
                         break 'main Ok(());
                     }
                 }
                 Err(e) => {
-                    // 播放列表获取失败：计入空轮计数
                     error!("[{}] 下载轮次出错: {}", self.username, e);
                     consecutive_empty_playlists += 1;
                     if consecutive_empty_playlists >= MAX_EMPTY_PLAYLISTS {
                         break 'main Err(e);
                     }
-                    if self
-                        .interruptible_sleep(tokio::time::Duration::from_secs(3))
-                        .await
-                    {
+                    if self.interruptible_sleep(tokio::time::Duration::from_secs(3)).await {
                         break 'main Ok(());
                     }
                 }
             }
         };
 
-        // --- 【退出循环后：处理最后一个未完成的分段】 ---
+        // --- 【收尾：关闭最后一个 FFmpeg 管道】 ---
         if let Err(e) = output_file.flush().await {
-            error!("[{}] 刷新文件缓冲区失败: {}", self.username, e);
+            error!("[{}] 最终刷新 FFmpeg 管道失败: {}", self.username, e);
         }
         drop(output_file);
+        let _ = ffmpeg_child.wait().await;
 
         if has_downloaded_content {
-            debug!("[{}] 正在转换最后一个录制分段 (Part {})...", self.username, part_index);
-            match convert_ts_to_mp4_static(&self.username, &temp_path, &current_output_path).await {
-                Ok(()) => {
-                    info!("[{}] 最后一个分段转换成功完成", self.username);
-                    if let Err(e) = tokio::fs::remove_file(&temp_path).await {
-                        error!("[{}] 清理临时文件失败: {}", self.username, e);
-                    }
-                }
-                Err(e) => {
-                    error!("[{}] 最后一个分段转换失败: {}", self.username, e);
-                    warn!("[{}] 原始数据已保留在: {:?}，可手动用 ffmpeg 修复", self.username, temp_path);
-                }
-            }
+            info!("[{}] 录制成功完成，所有分段已实时转换为真正的 MPEG-TS 流！", self.username);
         } else {
-            debug!("[{}] 没有下载任何内容，跳过视频转换", self.username);
-            if let Err(e) = tokio::fs::remove_file(&temp_path).await {
-                debug!("[{}] 清理空临时文件失败: {}", self.username, e);
-            }
+            // 如果什么都没下载到，删掉空文件
+            let _ = tokio::fs::remove_file(&current_ts_path).await;
         }
 
         download_result
