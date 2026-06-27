@@ -9,19 +9,12 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::broadcast;
 use url::Url;
 
-/// 每 N 个分片后执行一次 flush
 const FLUSH_INTERVAL: usize = 10;
-/// 空播放列表连续出现多少次后认为直播结束
 const MAX_EMPTY_PLAYLISTS: u32 = 10;
-/// 单个分片最大失败次数
 const MAX_SEGMENT_FAILURES: u32 = 5;
-/// 单个分片单次下载超时（秒）
 const SEGMENT_DOWNLOAD_TIMEOUT_SECS: u64 = 30;
-/// 有效分片的最小字节数
 const MIN_SEGMENT_SIZE: usize = 128;
-/// 连续 PendingRetry 轮次上限
 const MAX_CONSECUTIVE_PENDING_RETRIES: u32 = 20;
-/// 【核心新增】连续失败多少个分片后，判定为网络恶化并强行切断当前录制
 const MAX_CONSECUTIVE_FAILED_SEGMENTS: u32 = 3; 
 
 #[derive(Debug, PartialEq)]
@@ -29,6 +22,16 @@ enum RoundOutcome {
     DownloadedContent,
     NoNewSegments,
     PendingRetry,
+    FatalSegmentError, // 网络断开，需要重连
+    TicketedRoom,      // 403 门票房间，停止录制
+}
+
+/// 用于告诉外层大循环，当前录制段落是因为什么原因结束的
+enum SessionEndReason {
+    MaxDurationReached,
+    FatalSegmentError,
+    StreamEnded,
+    Shutdown,
 }
 
 pub struct HlsDownloader {
@@ -101,7 +104,6 @@ impl HlsDownloader {
         }
     }
 
-    /// 下载 HLS 流（自动 60 分钟分段，包含网络恶化主动止损和 fMP4 安全重整）
     pub async fn download_hls_stream<F>(
         &mut self,
         playlist_url: &str,
@@ -114,7 +116,7 @@ impl HlsDownloader {
         debug!("[{}] 开始 HLS 下载到: {:?}", self.username, output_path);
 
         let mut part_index = 1;
-        let max_duration = Duration::from_secs(60 * 60); // 设定为 60 分钟切断
+        let max_duration = Duration::from_secs(60 * 60); 
 
         'record_session: loop {
             let final_mp4_path = if part_index == 1 {
@@ -124,7 +126,6 @@ impl HlsDownloader {
                 output_path.with_file_name(format!("{}_part{}.mp4", file_stem, part_index))
             };
 
-            // 临时下载文件命名为 .ts，但底层将按照 fMP4 处理
             let temp_ts_path = output_path.with_extension(format!("tmp{}.ts", part_index));
             let file = File::create(&temp_ts_path).await?;
             let mut output_file = BufWriter::with_capacity(256 * 1024, file); 
@@ -132,7 +133,6 @@ impl HlsDownloader {
             let mut consecutive_empty_playlists = 0u32;
             let mut consecutive_pending_retries = 0u32; 
             
-            let mut received_shutdown = false; 
             let start_time = Instant::now();
 
             let calc_wait_time = |target_duration: u64| -> u64 {
@@ -141,10 +141,11 @@ impl HlsDownloader {
 
             let mut shutdown_rx = self.shutdown_rx.as_mut().map(|rx| rx.resubscribe());
 
-            let download_result = 'poll_loop: loop {
+            // 明确获取退出原因
+            let session_end_reason = 'poll_loop: loop {
                 if start_time.elapsed() >= max_duration {
                     info!("[{}] 当前录制已达 60 分钟，准备自动切断并生成当前分段...", self.username);
-                    break 'poll_loop Ok(()); 
+                    break 'poll_loop SessionEndReason::MaxDurationReached; 
                 }
 
                 let round_result = if let Some(ref mut rx) = shutdown_rx {
@@ -152,8 +153,7 @@ impl HlsDownloader {
                         r = self.download_playlist_segments(playlist_url, &mut output_file, m3u_processor) => r,
                         _ = rx.recv() => {
                             info!("[{}] 收到关闭信号，停止下载新分片，准备开始收尾转码...", self.username);
-                            received_shutdown = true; 
-                            break 'poll_loop Ok(());  
+                            break 'poll_loop SessionEndReason::Shutdown;  
                         }
                     }
                 } else {
@@ -171,30 +171,51 @@ impl HlsDownloader {
                         consecutive_pending_retries = 0;
                         consecutive_empty_playlists += 1;
                         if consecutive_empty_playlists >= MAX_EMPTY_PLAYLISTS {
-                            info!("[{}] 连续 {} 次未发现新分片，直播可能已结束", self.username, MAX_EMPTY_PLAYLISTS);
-                            break 'poll_loop Ok(());
+                            info!("[{}] 连续 {} 次未发现新分片，直播正常结束", self.username, MAX_EMPTY_PLAYLISTS);
+                            break 'poll_loop SessionEndReason::StreamEnded;
                         }
                         let wait_time = calc_wait_time(target_duration);
                         if self.interruptible_sleep(tokio::time::Duration::from_secs(wait_time)).await {
-                            received_shutdown = true;
-                            break 'poll_loop Ok(()); 
+                            break 'poll_loop SessionEndReason::Shutdown; 
                         }
                     }
                     Ok((RoundOutcome::PendingRetry, _)) => {
                         consecutive_pending_retries += 1;
                         if consecutive_pending_retries >= MAX_CONSECUTIVE_PENDING_RETRIES {
-                            warn!("[{}] 连续 {} 轮分片下载暂时失败，停止本段下载", self.username, MAX_CONSECUTIVE_PENDING_RETRIES);
-                            break 'poll_loop Ok(());
+                            warn!("[{}] 连续分片下载失败过多次，触发重连机制", self.username);
+                            break 'poll_loop SessionEndReason::FatalSegmentError;
                         }
                         if self.interruptible_sleep(tokio::time::Duration::from_secs(1)).await {
-                            received_shutdown = true;
-                            break 'poll_loop Ok(()); 
+                            break 'poll_loop SessionEndReason::Shutdown; 
                         }
                     }
+                    Ok((RoundOutcome::FatalSegmentError, _)) => {
+                        if !has_downloaded_content {
+                            // 如果重连后依然拿不到任何数据，说明不是临时断网，而是流彻底断开
+                            error!("[{}] 无法获取任何有效分片，放弃重连，彻底停止录制", self.username);
+                            break 'poll_loop SessionEndReason::StreamEnded;
+                        }
+                        error!("[{}] 网络异常或连接断开，立即触发断点保存与重连...", self.username);
+                        break 'poll_loop SessionEndReason::FatalSegmentError;
+                    }
+                    Ok((RoundOutcome::TicketedRoom, _)) => {
+                        error!("[{}] 检测到 403 被拒绝访问，主播开启了门票/付费限制，立即停止录制", self.username);
+                        // 遇到门票房间直接向最外层抛出错误，彻底终止该任务
+                        return Err(anyhow!("主播开启了门票/付费限制，已停止录制"));
+                    }
                     Err(e) => {
-                        // 【核心新增】捕获内部抛出的致命错误（如连续断网），强制跳出以保存进度
-                        error!("[{}] 网络异常或连接断开: {}，立即触发断点保存与重连...", self.username, e);
-                        break 'poll_loop Ok(()); 
+                        // 【核心修复】：播放列表 404 等错误，强制休眠，防止死循环
+                        error!("[{}] 获取播放列表异常: {}", self.username, e);
+                        consecutive_empty_playlists += 1; // 复用计数器
+                        
+                        if consecutive_empty_playlists >= MAX_EMPTY_PLAYLISTS {
+                            warn!("[{}] 连续 {} 次获取播放列表失败 (可能已下播或受限)，彻底停止录制", self.username, MAX_EMPTY_PLAYLISTS);
+                            break 'poll_loop SessionEndReason::StreamEnded;
+                        }
+                        
+                        if self.interruptible_sleep(tokio::time::Duration::from_secs(3)).await {
+                            break 'poll_loop SessionEndReason::Shutdown; 
+                        }
                     }
                 }
             };
@@ -225,20 +246,20 @@ impl HlsDownloader {
                 }
             }
 
-            match download_result {
-                Ok(()) => {
-                    if received_shutdown {
-                        info!("[{}] 录制收尾工作完成，已彻底退出", self.username);
-                        return Ok(());
-                    }
-
-                    // 满60分钟，或者因为断网触发主动保存后，开启下一个分段继续录制
+            // 根据内层退出原因，决定外层如何收尾
+            match session_end_reason {
+                SessionEndReason::Shutdown => {
+                    info!("[{}] 录制收尾工作完成，已彻底退出", self.username);
+                    return Ok(());
+                }
+                SessionEndReason::StreamEnded => {
+                    info!("[{}] 直播流已结束或失效，录制正常结束", self.username);
+                    return Ok(());
+                }
+                SessionEndReason::MaxDurationReached | SessionEndReason::FatalSegmentError => {
                     part_index += 1;
                     self.init_segment_downloaded = false; 
                     continue 'record_session;
-                }
-                Err(e) => {
-                    return Err(e);
                 }
             }
         }
@@ -269,7 +290,10 @@ impl HlsDownloader {
             .await?;
         
         if !response.status().is_success() {
-            return Err(anyhow!("获取播放列表失败: {}", response.status()));
+            if response.status() == reqwest::StatusCode::FORBIDDEN {
+                return Ok((RoundOutcome::TicketedRoom, 6)); // 主列表直接 403 门票拒绝
+            }
+            return Err(anyhow!("获取播放列表失败 ({}): 该地址可能已失效", response.status()));
         }
 
         let mut content = response.text().await?;
@@ -350,7 +374,7 @@ impl HlsDownloader {
                 let new_count = new_segments.len();
                 let mut any_succeeded = false;
                 let mut any_failed_pending = false;
-                let mut consecutive_failed_segments = 0; // 健康检查计数器
+                let mut consecutive_failed_segments = 0; 
                 let total_visible = self.total_processed_segments + new_count;
 
                 for (seg_url, seg_uri) in &new_segments {
@@ -362,7 +386,7 @@ impl HlsDownloader {
                             self.failed_segment_attempts.remove(seg_uri);
                         }
                         Ok(data) => {
-                            consecutive_failed_segments = 0; // 成功则重置失败计数
+                            consecutive_failed_segments = 0; 
 
                             info!(
                                 "[{}] 正在处理分片 {}/{} ({} 字节)",
@@ -384,10 +408,17 @@ impl HlsDownloader {
                         }
                         Err(e) => {
                             consecutive_failed_segments += 1;
+                            let err_msg = e.to_string();
 
-                            // 【核心新增】如果连续失败超过阈值，直接判定网络恶化并向上抛出错误
+                            // 【核心修复】抓取门票/付费状态，立即切断，杜绝空转！
+                            if err_msg.contains("403_FORBIDDEN") {
+                                warn!("[{}] 分片访问被拒绝 (403)，主播可能开启了门票/付费房间", self.username);
+                                return Ok((RoundOutcome::TicketedRoom, target_duration));
+                            }
+
                             if consecutive_failed_segments >= MAX_CONSECUTIVE_FAILED_SEGMENTS {
-                                return Err(anyhow!("网络状态极差，连续 {} 个分片下载失败，停止当前轮次", consecutive_failed_segments));
+                                warn!("[{}] 网络状态极差，连续 {} 个分片下载失败", self.username, consecutive_failed_segments);
+                                return Ok((RoundOutcome::FatalSegmentError, target_duration));
                             }
 
                             let attempts = self
@@ -397,7 +428,7 @@ impl HlsDownloader {
                                 .or_insert(1);
 
                             if *attempts >= MAX_SEGMENT_FAILURES {
-                                error!("[{}] 分片 {} 已失败 {} 次，放弃重试: {}", self.username, seg_uri, attempts, e);
+                                error!("[{}] 分片 {} 已失败 {} 次，放弃重试", self.username, seg_uri, attempts);
                                 self.downloaded_segments.insert(seg_uri.clone());
                                 self.failed_segment_attempts.remove(seg_uri);
                             } else {
@@ -469,13 +500,14 @@ impl HlsDownloader {
             .send()
             .await?;
 
+        // 【核心修复】移除偷偷吃掉 404/403 的逻辑，将它们变成硬错误，逼迫重试和门票识别触发！
         match response.status() {
             reqwest::StatusCode::OK => {}
-            reqwest::StatusCode::IM_A_TEAPOT => return Err(anyhow!("分片尚未就绪 (418)，将重试")),
-            reqwest::StatusCode::NOT_FOUND => return Ok(Vec::new()),
-            reqwest::StatusCode::FORBIDDEN => return Ok(Vec::new()),
-            reqwest::StatusCode::TOO_MANY_REQUESTS => return Err(anyhow!("请求过于频繁 (429)，将重试")),
-            status => return Err(anyhow!("下载分片失败: {} {}", status.as_u16(), status.canonical_reason().unwrap_or("未知"))),
+            reqwest::StatusCode::IM_A_TEAPOT => return Err(anyhow!("分片尚未就绪 (418)")),
+            reqwest::StatusCode::NOT_FOUND => return Err(anyhow!("404_NOT_FOUND")),
+            reqwest::StatusCode::FORBIDDEN => return Err(anyhow!("403_FORBIDDEN")),
+            reqwest::StatusCode::TOO_MANY_REQUESTS => return Err(anyhow!("请求过于频繁 (429)")),
+            status => return Err(anyhow!("下载分片失败: {}", status.as_u16())),
         }
 
         let content_type = response
@@ -512,7 +544,6 @@ impl HlsDownloader {
         Ok(bytes.to_vec())
     }
 
-    /// 使用强大的兼容参数处理碎片数据，规避 Invalid data 报错并生成标准 MP4
     async fn convert_ts_to_mp4(&self, ts_path: &Path, mp4_path: &Path) -> Result<()> {
         use std::process::Command;
 
@@ -520,7 +551,6 @@ impl HlsDownloader {
 
         let mut std_cmd = Command::new("ffmpeg");
         std_cmd
-            // 修复时间戳，并强制按 MP4 解析容器，防止后缀名误导导致的崩溃
             .arg("-fflags").arg("+genpts+igndts")
             .arg("-f").arg("mp4") 
             .arg("-i").arg(ts_path)
