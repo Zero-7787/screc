@@ -22,16 +22,16 @@ enum RoundOutcome {
     DownloadedContent,
     NoNewSegments,
     PendingRetry,
-    FatalSegmentError, // 网络断开，需要重连
-    TicketedRoom,      // 403 门票房间，停止录制
+    FatalSegmentError, 
+    TicketedRoom,      
 }
 
-/// 用于告诉外层大循环，当前录制段落是因为什么原因结束的
 enum SessionEndReason {
     MaxDurationReached,
     FatalSegmentError,
     StreamEnded,
     Shutdown,
+    TicketedRoom, // 【新增】门票房间退出状态
 }
 
 pub struct HlsDownloader {
@@ -141,7 +141,6 @@ impl HlsDownloader {
 
             let mut shutdown_rx = self.shutdown_rx.as_mut().map(|rx| rx.resubscribe());
 
-            // 明确获取退出原因
             let session_end_reason = 'poll_loop: loop {
                 if start_time.elapsed() >= max_duration {
                     info!("[{}] 当前录制已达 60 分钟，准备自动切断并生成当前分段...", self.username);
@@ -191,7 +190,6 @@ impl HlsDownloader {
                     }
                     Ok((RoundOutcome::FatalSegmentError, _)) => {
                         if !has_downloaded_content {
-                            // 如果重连后依然拿不到任何数据，说明不是临时断网，而是流彻底断开
                             error!("[{}] 无法获取任何有效分片，放弃重连，彻底停止录制", self.username);
                             break 'poll_loop SessionEndReason::StreamEnded;
                         }
@@ -199,17 +197,16 @@ impl HlsDownloader {
                         break 'poll_loop SessionEndReason::FatalSegmentError;
                     }
                     Ok((RoundOutcome::TicketedRoom, _)) => {
-                        error!("[{}] 检测到 403 被拒绝访问，主播开启了门票/付费限制，立即停止录制", self.username);
-                        // 遇到门票房间直接向最外层抛出错误，彻底终止该任务
-                        return Err(anyhow!("主播开启了门票/付费限制，已停止录制"));
+                        // 【核心修复】：不再直接 return Err，而是跳出循环，去执行下面的转码封包！
+                        error!("[{}] 检测到 403 被拒绝访问，主播开启了门票/付费限制，准备保存进度并停止录制", self.username);
+                        break 'poll_loop SessionEndReason::TicketedRoom;
                     }
                     Err(e) => {
-                        // 【核心修复】：播放列表 404 等错误，强制休眠，防止死循环
                         error!("[{}] 获取播放列表异常: {}", self.username, e);
-                        consecutive_empty_playlists += 1; // 复用计数器
+                        consecutive_empty_playlists += 1; 
                         
                         if consecutive_empty_playlists >= MAX_EMPTY_PLAYLISTS {
-                            warn!("[{}] 连续 {} 次获取播放列表失败 (可能已下播或受限)，彻底停止录制", self.username, MAX_EMPTY_PLAYLISTS);
+                            warn!("[{}] 连续 {} 次获取播放列表失败 (可能已下播)，正常结束录制", self.username, MAX_EMPTY_PLAYLISTS);
                             break 'poll_loop SessionEndReason::StreamEnded;
                         }
                         
@@ -220,6 +217,7 @@ impl HlsDownloader {
                 }
             };
 
+            // 循环结束，不论是什么原因，都会执行这里的缓冲区刷新和转码！
             if let Err(e) = output_file.flush().await {
                 error!("[{}] 刷新文件缓冲区失败: {}", self.username, e);
             }
@@ -246,7 +244,7 @@ impl HlsDownloader {
                 }
             }
 
-            // 根据内层退出原因，决定外层如何收尾
+            // 根据退出原因收尾：如果是门票限制，就在转码完成后向主控台抛出错误
             match session_end_reason {
                 SessionEndReason::Shutdown => {
                     info!("[{}] 录制收尾工作完成，已彻底退出", self.username);
@@ -255,6 +253,10 @@ impl HlsDownloader {
                 SessionEndReason::StreamEnded => {
                     info!("[{}] 直播流已结束或失效，录制正常结束", self.username);
                     return Ok(());
+                }
+                SessionEndReason::TicketedRoom => {
+                    info!("[{}] 已保存门票开启前的视频内容", self.username);
+                    return Err(anyhow!("主播开启了门票/付费限制，已停止录制")); // 报错给主控台，让其切换到 Private 状态
                 }
                 SessionEndReason::MaxDurationReached | SessionEndReason::FatalSegmentError => {
                     part_index += 1;
@@ -291,7 +293,7 @@ impl HlsDownloader {
         
         if !response.status().is_success() {
             if response.status() == reqwest::StatusCode::FORBIDDEN {
-                return Ok((RoundOutcome::TicketedRoom, 6)); // 主列表直接 403 门票拒绝
+                return Ok((RoundOutcome::TicketedRoom, 6)); 
             }
             return Err(anyhow!("获取播放列表失败 ({}): 该地址可能已失效", response.status()));
         }
@@ -410,7 +412,6 @@ impl HlsDownloader {
                             consecutive_failed_segments += 1;
                             let err_msg = e.to_string();
 
-                            // 【核心修复】抓取门票/付费状态，立即切断，杜绝空转！
                             if err_msg.contains("403_FORBIDDEN") {
                                 warn!("[{}] 分片访问被拒绝 (403)，主播可能开启了门票/付费房间", self.username);
                                 return Ok((RoundOutcome::TicketedRoom, target_duration));
@@ -500,7 +501,6 @@ impl HlsDownloader {
             .send()
             .await?;
 
-        // 【核心修复】移除偷偷吃掉 404/403 的逻辑，将它们变成硬错误，逼迫重试和门票识别触发！
         match response.status() {
             reqwest::StatusCode::OK => {}
             reqwest::StatusCode::IM_A_TEAPOT => return Err(anyhow!("分片尚未就绪 (418)")),
