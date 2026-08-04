@@ -1,5 +1,5 @@
 use chrono::{DateTime, Local};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -94,13 +94,19 @@ pub struct SharedGuiState {
 
 struct SharedGuiStateInner {
     models: Vec<ModelStatus>,
+    /// 模特数据变化时递增，供 GUI 判断是否需要刷新
+    models_version: u64,
     logs: VecDeque<LogEntry>,
+    /// 每次追加日志时递增，供 GUI 增量刷新判断
+    log_serial: u64,
     max_logs: usize,
     config_path: Option<PathBuf>,
     command_tx: Option<tokio::sync::mpsc::UnboundedSender<ModelCommand>>,
     recording_active: bool,
     app_config: Option<Arc<tokio::sync::Mutex<AppConfig>>>,
     config_version: u64,
+    /// 配置字段 → 写入代数，用于合并连续防抖写入
+    config_write_generations: HashMap<String, u64>,
 }
 
 impl SharedGuiState {
@@ -108,13 +114,16 @@ impl SharedGuiState {
         Self {
             inner: Arc::new(Mutex::new(SharedGuiStateInner {
                 models: Vec::new(),
+                models_version: 0,
                 logs: VecDeque::new(),
+                log_serial: 0,
                 max_logs: 100_000,
                 config_path: None,
                 command_tx: None,
                 recording_active: false,
                 app_config: None,
                 config_version: 0,
+                config_write_generations: HashMap::new(),
             })),
         }
     }
@@ -137,26 +146,28 @@ impl SharedGuiState {
         // 0. 从新路径加载配置（在锁外完成，避免 I/O 阻塞 GUI）
         let new_config = AppConfig::from_file(new_path)?;
 
-        let mut inner = self.inner.lock().unwrap();
+        // 1. 停止所有录制，并取出 app_config 的 Arc（短暂持锁）
+        let app_config = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.recording_active = false;
+            if let Some(ref tx) = inner.command_tx {
+                let _ = tx.send(ModelCommand::StopAll);
+            }
+            inner
+                .app_config
+                .as_ref()
+                .expect("app_config not set; call set_app_config() during initialization")
+                .clone()
+        };
 
-        // 1. 停止所有录制
-        inner.recording_active = false;
-        if let Some(ref tx) = inner.command_tx {
-            let _ = tx.send(ModelCommand::StopAll);
-        }
-
-        // 2. 更新 shared_app_config
-        let app_config = inner
-            .app_config
-            .as_ref()
-            .expect("app_config not set; call set_app_config() during initialization");
+        // 2. 更新 shared_app_config（锁外等待，避免持锁期间被录制回调阻塞）
         *tokio::task::block_in_place(|| app_config.blocking_lock()) = new_config.clone();
 
-        // 3. 更新 config_path
+        // 3. 更新 config_path / version，并重建模型列表
+        let mut inner = self.inner.lock().unwrap();
         inner.config_path = Some(new_path.to_path_buf());
         inner.config_version += 1;
 
-        // 4. 重建模型列表
         let entries = new_config.get_model_entries();
         inner.models = entries
             .iter()
@@ -170,6 +181,7 @@ impl SharedGuiState {
                 file_path: None,
             })
             .collect();
+        inner.models_version += 1;
 
         Ok(())
     }
@@ -230,6 +242,7 @@ impl SharedGuiState {
                 file_path: None,
             })
             .collect();
+        inner.models_version += 1;
     }
 
     /// 更新某个模特的直播状态
@@ -238,6 +251,7 @@ impl SharedGuiState {
         if let Some(m) = inner.models.iter_mut().find(|m| m.username == username) {
             m.status = status;
             m.last_check = Some(Local::now());
+            inner.models_version += 1;
         }
     }
 
@@ -253,6 +267,7 @@ impl SharedGuiState {
                 m.recording_start = None;
                 m.file_path = None;
             }
+            inner.models_version += 1;
         }
     }
 
@@ -268,6 +283,40 @@ impl SharedGuiState {
             inner.logs.pop_front();
         }
         inner.logs.push_back(entry);
+        inner.log_serial = inner.log_serial.wrapping_add(1);
+    }
+
+    /// 日志版本号：每次追加日志时递增（用于 GUI 增量刷新，避免全量克隆）
+    pub fn log_version(&self) -> u64 {
+        self.inner.lock().unwrap().log_serial
+    }
+
+    /// 模特数据版本号：任何模特数据变化时递增（用于 GUI 判断是否需要刷新）
+    pub fn models_version(&self) -> u64 {
+        self.inner.lock().unwrap().models_version
+    }
+
+    /// 记录一次待执行的配置写入，返回本次写入的代数
+    /// 同一字段连续多次调用时，只有最后一代会被真正写入文件
+    pub fn begin_config_write(&self, key: &str) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        let entry = inner
+            .config_write_generations
+            .entry(key.to_string())
+            .or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    /// 判断指定代数是否仍是最新（用于跳过过期的防抖写入）
+    pub fn is_latest_config_write(&self, key: &str, generation: u64) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .config_write_generations
+            .get(key)
+            .copied()
+            == Some(generation)
     }
 
     /// 获取所有模特快照
@@ -277,21 +326,24 @@ impl SharedGuiState {
 
     /// 切换模特启用状态，发送启停命令并同步到配置文件
     pub fn set_model_enabled(&self, username: &str, enabled: bool) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(m) = inner.models.iter_mut().find(|m| m.username == username) {
-            m.enabled = enabled;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(m) = inner.models.iter_mut().find(|m| m.username == username) {
+                m.enabled = enabled;
+                inner.models_version += 1;
+            }
+            // 发送启停命令到管理器
+            if let Some(ref tx) = inner.command_tx {
+                let cmd = if enabled {
+                    ModelCommand::Enable(username.to_string())
+                } else {
+                    ModelCommand::Disable(username.to_string())
+                };
+                let _ = tx.send(cmd);
+            }
         }
-        // 发送启停命令到管理器
-        if let Some(ref tx) = inner.command_tx {
-            let cmd = if enabled {
-                ModelCommand::Enable(username.to_string())
-            } else {
-                ModelCommand::Disable(username.to_string())
-            };
-            let _ = tx.send(cmd);
-        }
-        // 同步到配置文件
-        Self::sync_config_inner(&inner);
+        // 同步到配置文件（I/O 在锁外执行）
+        self.sync_config();
     }
 
     /// 获取所有日志快照
@@ -301,27 +353,30 @@ impl SharedGuiState {
 
     /// 新增模特
     pub fn add_model(&self, username: &str, enabled: bool) {
-        let mut inner = self.inner.lock().unwrap();
-        // 检查是否已存在
-        if inner.models.iter().any(|m| m.username == username) {
-            return;
-        }
-        inner.models.push(ModelStatus {
-            username: username.to_string(),
-            enabled,
-            status: ModelStreamStatus::Unknown,
-            is_recording: false,
-            recording_start: None,
-            last_check: None,
-            file_path: None,
-        });
-        // 发送命令到管理器
-        if enabled {
-            if let Some(ref tx) = inner.command_tx {
-                let _ = tx.send(ModelCommand::Add(username.to_string(), true));
+        {
+            let mut inner = self.inner.lock().unwrap();
+            // 检查是否已存在
+            if inner.models.iter().any(|m| m.username == username) {
+                return;
+            }
+            inner.models.push(ModelStatus {
+                username: username.to_string(),
+                enabled,
+                status: ModelStreamStatus::Unknown,
+                is_recording: false,
+                recording_start: None,
+                last_check: None,
+                file_path: None,
+            });
+            inner.models_version += 1;
+            // 发送命令到管理器
+            if enabled {
+                if let Some(ref tx) = inner.command_tx {
+                    let _ = tx.send(ModelCommand::Add(username.to_string(), true));
+                }
             }
         }
-        Self::sync_config_inner(&inner);
+        self.sync_config();
     }
 
     /// 获取总录制开关状态
@@ -345,18 +400,45 @@ impl SharedGuiState {
 
     /// 删除模特
     pub fn remove_model(&self, username: &str) {
-        let mut inner = self.inner.lock().unwrap();
-        // 发送移除命令（管理器会停止录制）
-        if let Some(ref tx) = inner.command_tx {
-            let _ = tx.send(ModelCommand::Remove(username.to_string()));
+        {
+            let mut inner = self.inner.lock().unwrap();
+            // 发送移除命令（管理器会停止录制）
+            if let Some(ref tx) = inner.command_tx {
+                let _ = tx.send(ModelCommand::Remove(username.to_string()));
+            }
+            inner.models.retain(|m| m.username != username);
+            inner.models_version += 1;
         }
-        inner.models.retain(|m| m.username != username);
-        Self::sync_config_inner(&inner);
+        self.sync_config();
     }
 
-    /// 内部辅助：同步模特列表到配置文件
-    fn sync_config_inner(inner: &SharedGuiStateInner) {
-        if let Some(ref config_path) = inner.config_path {
+    /// 上移/下移模特（手动排序）：delta 为 -1 表示上移，1 表示下移
+    pub fn move_model(&self, username: &str, delta: i32) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let Some(ix) = inner.models.iter().position(|m| m.username == username) else {
+                return;
+            };
+            let len = inner.models.len() as i32;
+            let new_ix = (ix as i32 + delta).clamp(0, len - 1) as usize;
+            if new_ix == ix {
+                return;
+            }
+            let m = inner.models.remove(ix);
+            inner.models.insert(new_ix, m);
+            inner.models_version += 1;
+        }
+        // 排序结果同步到配置文件（保持 usernames 数组顺序）
+        self.sync_config();
+    }
+
+    /// 同步模特列表到配置文件（I/O 与锁等待均在锁外执行，避免阻塞 GUI）
+    fn sync_config(&self) {
+        // 锁内只收集数据，不执行任何 I/O
+        let (config_path, app_config, entries) = {
+            let inner = self.inner.lock().unwrap();
+            let config_path = inner.config_path.clone();
+            let app_config = inner.app_config.clone();
             let entries: Vec<serde_json::Value> = inner
                 .models
                 .iter()
@@ -367,11 +449,22 @@ impl SharedGuiState {
                     })
                 })
                 .collect();
-            let _ = AppConfig::update_field(
-                config_path,
-                "usernames",
-                serde_json::Value::Array(entries),
-            );
+            (config_path, app_config, entries)
+        };
+
+        let Some(ref config_path) = config_path else {
+            return;
+        };
+
+        // 如果配置文件不存在，先写入完整默认配置（锁外 I/O）
+        if !config_path.exists() {
+            if let Some(ref app_config) = app_config {
+                let config = tokio::task::block_in_place(|| app_config.blocking_lock());
+                let _ = config.save_to_file(config_path);
+            }
         }
+
+        let _ =
+            AppConfig::update_field(config_path, "usernames", serde_json::Value::Array(entries));
     }
 }

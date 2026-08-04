@@ -4,6 +4,7 @@ use std::time::Duration;
 use chrono::Local;
 use gpui::AppContext as _;
 use gpui::*;
+use gpui::{Pixels, Size};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement as _;
@@ -19,7 +20,35 @@ use gpui_component::*;
 
 use screc_core::config::AppConfig;
 
-use crate::shared_state::{LogLevel, ModelStreamStatus, SharedGuiState};
+use crate::shared_state::{LogEntry, LogLevel, ModelStreamStatus, SharedGuiState};
+
+/// 底部状态栏时钟：独立实体每秒自刷新，避免拖动主视图全量重渲染
+struct ClockView {
+    _tick: Task<()>,
+}
+
+impl ClockView {
+    fn new(cx: &mut Context<Self>) -> Self {
+        let tick = cx.spawn(async |entity: WeakEntity<ClockView>, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if entity.update(cx, |_this, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { _tick: tick }
+    }
+}
+
+impl Render for ClockView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(format!("{}", Local::now().format("%Y-%m-%d %H:%M:%S")))
+    }
+}
 
 /// GUI 主视图
 pub struct AppView {
@@ -35,9 +64,24 @@ pub struct AppView {
     _refresh_task: Task<()>,
     _appearance_subscription: Subscription,
 
+    // 底部状态栏时钟（独立实体每秒自刷新，避免主视图全量重渲染）
+    clock: Entity<ClockView>,
+    // 上次刷新时看到的版本号，用于判断数据是否变化
+    last_seen_models_version: u64,
+    last_seen_log_version: u64,
+
     // 配置切换
     settings_new_config_path: Entity<InputState>,
     settings_config_switch_error: Option<String>,
+
+    // 日志列表缓存（避免每次渲染全量克隆，仅当日志版本变化时重建）
+    log_cache: Rc<Vec<LogEntry>>,
+    log_item_sizes: Rc<Vec<Size<Pixels>>>,
+    log_cache_version: u64,
+    /// 已自动滚动到的日志版本
+    last_auto_scroll_version: u64,
+    /// 重新开启自动滚动时，强制下一次渲染滚动到底
+    auto_scroll_pending: bool,
 }
 
 impl AppView {
@@ -62,19 +106,37 @@ impl AppView {
             cx.notify();
         });
 
-        // 每秒刷新一次
+        // 底部状态栏时钟：独立实体每秒自刷新
+        let clock = cx.new(|cx| ClockView::new(cx));
+
+        // 每秒检查一次是否需要刷新：
+        // - 有录制进行中时，录制时长每秒变化需要刷新
+        // - 模特状态 / 日志新增时触发刷新
+        // 空闲时（无录制、无变化）不重渲染，避免无谓开销
+        let last_seen_models_version = gui_state.models_version();
+        let last_seen_log_version = gui_state.log_version();
         let refresh_task = cx.spawn(async |entity: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(1))
                     .await;
-                if entity
-                    .update(cx, |_this, cx| {
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
+                let should_refresh = entity.update(cx, |this, _cx| {
+                    let models_version = this.gui_state.models_version();
+                    let log_version = this.gui_state.log_version();
+                    let changed = models_version != this.last_seen_models_version
+                        || log_version != this.last_seen_log_version;
+                    this.last_seen_models_version = models_version;
+                    this.last_seen_log_version = log_version;
+                    changed || this.gui_state.is_recording_active()
+                });
+                match should_refresh {
+                    Ok(true) => {
+                        if entity.update(cx, |_this, cx| cx.notify()).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(_) => break,
                 }
             }
         });
@@ -110,22 +172,40 @@ impl AppView {
 
             settings_new_config_path,
             settings_config_switch_error: None,
+
+            log_cache: Rc::new(Vec::new()),
+            log_item_sizes: Rc::new(Vec::new()),
+            log_cache_version: 0,
+            last_auto_scroll_version: 0,
+            auto_scroll_pending: false,
+
+            clock,
+            last_seen_models_version,
+            last_seen_log_version,
         }
     }
 
-    /// 防抖保存辅助：从 &mut App 上下文中异步写入配置文件
+    /// 防抖保存辅助：异步写入配置文件，合并同一字段的连续多次写入
+    /// 如果配置文件不存在，会先用完整默认配置创建文件，再更新指定字段
     fn debounced_update_field(
         key: &'static str,
         value: serde_json::Value,
-        _cx: &mut App,
         gui_state: &SharedGuiState,
     ) {
         let state = gui_state.clone();
         let key = key.to_string();
+        let generation = state.begin_config_write(&key);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            let config_path = state.get_config_path();
-            if let Some(ref path) = config_path {
+            // 若期间已有更新的写入，跳过本次过期写入，避免冗余写盘
+            if !state.is_latest_config_write(&key, generation) {
+                return;
+            }
+            if let Some(ref path) = state.get_config_path() {
+                // 如果配置文件不存在，先写入完整配置
+                if !path.exists() {
+                    let _ = state.with_app_config(|config| config.save_to_file(path));
+                }
                 let _ = AppConfig::update_field(path, &key, value);
             }
         });
@@ -170,6 +250,8 @@ impl AppView {
             let enabled = model.enabled;
             let username = model.username.clone();
             let is_recording = model.is_recording;
+            let can_move_up = row_ix > 0;
+            let can_move_down = row_ix + 1 < models.len();
             let duration_text = if let Some(ref start) = model.recording_start {
                 AppView::format_duration(start)
             } else {
@@ -200,16 +282,27 @@ impl AppView {
                 cx.notify();
             });
 
+            let gui_state_move_up = self.gui_state.clone();
+            let username_move_up = username.clone();
+            let on_move_up = cx.listener(move |_this, _ev, _window, cx| {
+                gui_state_move_up.move_model(&username_move_up, -1);
+                cx.notify();
+            });
+
+            let gui_state_move_down = self.gui_state.clone();
+            let username_move_down = username.clone();
+            let on_move_down = cx.listener(move |_this, _ev, _window, cx| {
+                gui_state_move_down.move_model(&username_move_down, 1);
+                cx.notify();
+            });
+
             let row = TableRow::new()
                 .child(
                     TableCell::new().w(px(50.)).child(
-                        Switch::new(ElementId::NamedInteger(
-                            "model-enabled".into(),
-                            row_ix as u64,
-                        ))
-                        .checked(enabled)
-                        .xsmall()
-                        .on_click(on_toggle),
+                        Switch::new(ElementId::Name(format!("model-enabled-{username}").into()))
+                            .checked(enabled)
+                            .xsmall()
+                            .on_click(on_toggle),
                     ),
                 )
                 .child(
@@ -234,7 +327,7 @@ impl AppView {
                 .child(
                     TableCell::new().flex_1().child(
                         div()
-                            .id(ElementId::NamedInteger("filepath".into(), row_ix as u64))
+                            .id(ElementId::Name(format!("filepath-{username}").into()))
                             .text_xs()
                             .text_color(muted_color)
                             .overflow_hidden()
@@ -247,16 +340,41 @@ impl AppView {
                     ),
                 )
                 .child(
-                    TableCell::new().w(px(60.)).child(
-                        Button::new(ElementId::NamedInteger(
-                            "delete-model".into(),
-                            row_ix as u64,
-                        ))
-                        .xsmall()
-                        .compact()
-                        .danger()
-                        .label("删除")
-                        .on_click(on_delete),
+                    TableCell::new().w(px(130.)).child(
+                        div()
+                            .h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                Button::new(ElementId::Name(format!("move-up-{username}").into()))
+                                    .xsmall()
+                                    .compact()
+                                    .icon(IconName::ChevronUp)
+                                    .disabled(!can_move_up)
+                                    .tooltip("上移")
+                                    .on_click(on_move_up),
+                            )
+                            .child(
+                                Button::new(ElementId::Name(
+                                    format!("move-down-{username}").into(),
+                                ))
+                                .xsmall()
+                                .compact()
+                                .icon(IconName::ChevronDown)
+                                .disabled(!can_move_down)
+                                .tooltip("下移")
+                                .on_click(on_move_down),
+                            )
+                            .child(
+                                Button::new(ElementId::Name(
+                                    format!("delete-model-{username}").into(),
+                                ))
+                                .xsmall()
+                                .compact()
+                                .danger()
+                                .label("删除")
+                                .on_click(on_delete),
+                            ),
                     ),
                 );
 
@@ -342,7 +460,7 @@ impl AppView {
                                 .child(TableHead::new().w(px(80.)).child("录制"))
                                 .child(TableHead::new().w(px(90.)).child("录制时长"))
                                 .child(TableHead::new().flex_1().child("文件路径"))
-                                .child(TableHead::new().w(px(60.)).child("操作")),
+                                .child(TableHead::new().w(px(130.)).child("操作")),
                         ),
                     )
                     // 可滚动表体
@@ -366,28 +484,40 @@ impl AppView {
     }
 
     /// 渲染日志面板
-    fn render_log_panel(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let logs = self.gui_state.get_logs();
-        let log_count = logs.len();
-
-        // 自动滚动到底部
-        if self.auto_scroll_logs && log_count > 0 {
-            self.log_scroll_handle
-                .scroll_to_item(log_count - 1, ScrollStrategy::Top);
-        }
-
+    fn render_log_panel(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // 每行固定高度（虚拟列表要求），与渲染时 .h(row_height) 保持一致
         let row_height = px(20.);
-        let item_sizes = Rc::new(
-            (0..log_count)
-                .map(|_| size(px(0.), row_height))
-                .collect::<Vec<_>>(),
-        );
 
-        // 将快照放入 Rc，避免在闭包中多次克隆整个 Vec
-        let logs_rc = Rc::new(logs);
-        let logs_for_closure = logs_rc.clone();
+        // 仅当日志版本变化时重建缓存，避免每次渲染全量克隆最多 10 万条日志
+        let log_version = self.gui_state.log_version();
+        if log_version != self.log_cache_version {
+            self.log_cache = Rc::new(self.gui_state.get_logs());
+            self.log_item_sizes = Rc::new(
+                (0..self.log_cache.len())
+                    .map(|_| size(px(0.), row_height))
+                    .collect::<Vec<_>>(),
+            );
+            self.log_cache_version = log_version;
+        }
+        let log_count = self.log_cache.len();
+        let item_sizes = self.log_item_sizes.clone();
+        let logs_for_closure = self.log_cache.clone();
         let log_font_clone = self.log_font.clone();
+
+        // 自动滚动到底部（仅在新日志到达或重新开启自动滚动时触发）
+        if self.auto_scroll_logs
+            && log_count > 0
+            && (log_version != self.last_auto_scroll_version || self.auto_scroll_pending)
+        {
+            self.log_scroll_handle
+                .scroll_to_item(log_count - 1, ScrollStrategy::Top);
+            self.last_auto_scroll_version = log_version;
+            self.auto_scroll_pending = false;
+        }
 
         div()
             .flex_1()
@@ -424,6 +554,9 @@ impl AppView {
                                     .xsmall()
                                     .on_click(cx.listener(|this, checked, _window, cx| {
                                         this.auto_scroll_logs = *checked;
+                                        if *checked {
+                                            this.auto_scroll_pending = true;
+                                        }
                                         cx.notify();
                                     })),
                             ),
@@ -514,19 +647,18 @@ impl AppView {
                                     sc.with_app_config(|c| SharedString::from(c.get_output_dir()))
                                 }
                             },
-                            move |val: SharedString, cx: &mut App| {
+                            move |val: SharedString, _cx: &mut App| {
                                 let v = val.to_string();
                                 s.with_app_config_mut(|c| c.output_dir = Some(v.clone()));
                                 Self::debounced_update_field(
                                     "output_dir",
                                     serde_json::Value::String(v),
-                                    cx,
                                     &s,
                                 );
                             },
                         ),
                     )
-                    .description("录制视频的保存目录")
+                    .description("录制视频的保存目录（重新启动录制后生效）")
                 },
                 {
                     let s = state.clone();
@@ -542,19 +674,18 @@ impl AppView {
                                 let sc = s.clone();
                                 move |_: &App| sc.with_app_config(|c| c.get_resolution() as f64)
                             },
-                            move |val: f64, cx: &mut App| {
+                            move |val: f64, _cx: &mut App| {
                                 let v = val as u32;
                                 s.with_app_config_mut(|c| c.resolution = Some(v));
                                 Self::debounced_update_field(
                                     "resolution",
                                     serde_json::Value::from(v),
-                                    cx,
                                     &s,
                                 );
                             },
                         ),
                     )
-                    .description("视频分辨率 (240-2160，步长 120)")
+                    .description("视频分辨率 (240-2160，步长 120，重新启动录制后生效)")
                 },
                 {
                     let s = state.clone();
@@ -570,19 +701,18 @@ impl AppView {
                                 let sc = s.clone();
                                 move |_: &App| sc.with_app_config(|c| c.get_check_interval() as f64)
                             },
-                            move |val: f64, cx: &mut App| {
+                            move |val: f64, _cx: &mut App| {
                                 let v = val as u64;
                                 s.with_app_config_mut(|c| c.check_interval = Some(v));
                                 Self::debounced_update_field(
                                     "check_interval",
                                     serde_json::Value::from(v),
-                                    cx,
                                     &s,
                                 );
                             },
                         ),
                     )
-                    .description("检查模特在线状态的时间间隔")
+                    .description("检查模特在线状态的时间间隔（即时生效）")
                 },
             ]),
         ])
@@ -605,20 +735,16 @@ impl AppView {
                                 })
                             }
                         },
-                        move |val: SharedString, cx: &mut App| {
+                        move |val: SharedString, _cx: &mut App| {
                             let v = val.to_string();
                             s.with_app_config_mut(|c| {
                                 c.proxy = if v.is_empty() { None } else { Some(v.clone()) }
                             });
-                            Self::debounced_update_field(
-                                "proxy",
-                                serde_json::Value::String(v),
-                                cx,
-                                &s,
-                            );
+                            Self::debounced_update_field("proxy", serde_json::Value::String(v), &s);
                         },
                     ),
                 )
+                .description("新启动的录制任务生效，正在录制的模特需停止后重启")
             },
             {
                 let s = state.clone();
@@ -633,7 +759,7 @@ impl AppView {
                                 })
                             }
                         },
-                        move |val: SharedString, cx: &mut App| {
+                        move |val: SharedString, _cx: &mut App| {
                             let v = val.to_string();
                             s.with_app_config_mut(|c| {
                                 c.proxy_username = if v.is_empty() { None } else { Some(v.clone()) }
@@ -641,12 +767,12 @@ impl AppView {
                             Self::debounced_update_field(
                                 "proxy_username",
                                 serde_json::Value::String(v),
-                                cx,
                                 &s,
                             );
                         },
                     ),
                 )
+                .description("新启动的录制任务生效，正在录制的模特需停止后重启")
             },
             {
                 let s = state.clone();
@@ -661,7 +787,7 @@ impl AppView {
                                 })
                             }
                         },
-                        move |val: SharedString, cx: &mut App| {
+                        move |val: SharedString, _cx: &mut App| {
                             let v = val.to_string();
                             s.with_app_config_mut(|c| {
                                 c.proxy_password = if v.is_empty() { None } else { Some(v.clone()) }
@@ -669,12 +795,12 @@ impl AppView {
                             Self::debounced_update_field(
                                 "proxy_password",
                                 serde_json::Value::String(v),
-                                cx,
                                 &s,
                             );
                         },
                     ),
                 )
+                .description("新启动的录制任务生效，正在录制的模特需停止后重启")
             },
             {
                 let s = state.clone();
@@ -707,20 +833,11 @@ impl AppView {
                                                 g.with_app_config_mut(|c| {
                                                     c.user_agent = Some(val.clone())
                                                 });
-                                                let g2 = g.clone();
-                                                tokio::spawn(async move {
-                                                    tokio::time::sleep(
-                                                        std::time::Duration::from_millis(500),
-                                                    )
-                                                    .await;
-                                                    if let Some(ref path) = g2.get_config_path() {
-                                                        let _ = AppConfig::update_field(
-                                                            path,
-                                                            "user_agent",
-                                                            serde_json::Value::String(val),
-                                                        );
-                                                    }
-                                                });
+                                                Self::debounced_update_field(
+                                                    "user_agent",
+                                                    serde_json::Value::String(val),
+                                                    &g,
+                                                );
                                             }
                                         },
                                     );
@@ -733,6 +850,7 @@ impl AppView {
                         }
                     }),
                 )
+                .description("新启动的录制任务生效，正在录制的模特需停止后重启")
                 .layout(Axis::Vertical)
             },
             {
@@ -774,21 +892,11 @@ impl AppView {
                                                             Some(val.clone())
                                                         }
                                                     });
-                                                    let g2 = g.clone();
-                                                    tokio::spawn(async move {
-                                                        tokio::time::sleep(
-                                                            std::time::Duration::from_millis(500),
-                                                        )
-                                                        .await;
-                                                        if let Some(ref path) = g2.get_config_path()
-                                                        {
-                                                            let _ = AppConfig::update_field(
-                                                                path,
-                                                                "cookies",
-                                                                serde_json::Value::String(val),
-                                                            );
-                                                        }
-                                                    });
+                                                    Self::debounced_update_field(
+                                                        "cookies",
+                                                        serde_json::Value::String(val),
+                                                        &g,
+                                                    );
                                                 }
                                             }
                                         },
@@ -806,7 +914,7 @@ impl AppView {
                         }
                     }),
                 )
-                .description("录制运行中不可编辑")
+                .description("录制运行中不可编辑；修改后新录制任务生效")
                 .layout(Axis::Vertical)
             },
         ])])
@@ -825,18 +933,19 @@ impl AppView {
                             let sc = s.clone();
                             move |_: &App| sc.with_app_config(|c| c.get_debug())
                         },
-                        move |val: bool, cx: &mut App| {
+                        move |val: bool, _cx: &mut App| {
                             s.with_app_config_mut(|c| c.debug = Some(val));
-                            Self::debounced_update_field(
-                                "debug",
-                                serde_json::Value::Bool(val),
-                                cx,
-                                &s,
-                            );
+                            // 即时生效：动态切换日志级别
+                            log::set_max_level(if val {
+                                log::LevelFilter::Debug
+                            } else {
+                                log::LevelFilter::Info
+                            });
+                            Self::debounced_update_field("debug", serde_json::Value::Bool(val), &s);
                         },
                     ),
                 )
-                .description("启用详细的调试日志输出")
+                .description("启用详细的调试日志输出（即时生效）")
             },
             {
                 let s = state.clone();
@@ -847,18 +956,17 @@ impl AppView {
                             let sc = s.clone();
                             move |_: &App| sc.with_app_config(|c| c.get_log_to_file())
                         },
-                        move |val: bool, cx: &mut App| {
+                        move |val: bool, _cx: &mut App| {
                             s.with_app_config_mut(|c| c.log_to_file = Some(val));
                             Self::debounced_update_field(
                                 "log_to_file",
                                 serde_json::Value::Bool(val),
-                                cx,
                                 &s,
                             );
                         },
                     ),
                 )
-                .description("将日志同时写入文件")
+                .description("将日志同时写入文件（重启应用后生效）")
             },
             {
                 let s = state.clone();
@@ -871,19 +979,18 @@ impl AppView {
                                 sc.with_app_config(|c| SharedString::from(c.get_log_file_path()))
                             }
                         },
-                        move |val: SharedString, cx: &mut App| {
+                        move |val: SharedString, _cx: &mut App| {
                             let v = val.to_string();
                             s.with_app_config_mut(|c| c.log_file_path = Some(v.clone()));
                             Self::debounced_update_field(
                                 "log_file_path",
                                 serde_json::Value::String(v),
-                                cx,
                                 &s,
                             );
                         },
                     ),
                 )
-                .description("日志文件的保存路径")
+                .description("日志文件的保存路径（重启应用后生效）")
             },
         ])])
     }
@@ -1132,7 +1239,7 @@ impl Render for AppView {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(format!("{}", Local::now().format("%Y-%m-%d %H:%M:%S"))),
+                            .child(self.clock.clone()),
                     )
                     .child(
                         div()

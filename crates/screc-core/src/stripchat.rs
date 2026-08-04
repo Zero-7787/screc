@@ -134,12 +134,15 @@ impl StripChatRecorder {
         app_config: Arc<Mutex<AppConfig>>,
         config_file_path: Option<PathBuf>,
         cli_has_cookies: bool,
-        original_config_cookies: Option<String>,
     ) -> Result<Self> {
-        // 确定cookie来源
+        // 确定cookie来源（config.cookies 为创建任务时的动态快照，支持 GUI 修改后即时判断）
         let cookie_source = if cli_has_cookies {
             CookieSource::CommandLine
-        } else if original_config_cookies.is_some() {
+        } else if config
+            .cookies
+            .as_ref()
+            .is_some_and(|c| !c.trim().is_empty())
+        {
             CookieSource::ConfigFile
         } else {
             CookieSource::None
@@ -251,6 +254,11 @@ impl StripChatRecorder {
     /// 设置外部回调（如 GUI 状态报告）
     pub fn set_callback(&mut self, callback: Arc<dyn RecorderCallback>) {
         self.callback = Some(callback);
+    }
+
+    /// 从共享配置动态读取检查间隔（支持即时生效）
+    async fn get_check_interval(&self) -> u64 {
+        self.app_config.lock().await.get_check_interval()
     }
 
     /// 报告状态变化到外部回调
@@ -527,10 +535,9 @@ impl StripChatRecorder {
                                     self.status = StreamStatus::Error;
                                 }
                                 // 录制完成后等待一段时间再检查
+                                let ci = self.get_check_interval().await;
                                 if self
-                                    .interruptible_sleep(tokio::time::Duration::from_secs(
-                                        self.config.check_interval,
-                                    ))
+                                    .interruptible_sleep(tokio::time::Duration::from_secs(ci))
                                     .await
                                 {
                                     return Ok(());
@@ -549,7 +556,7 @@ impl StripChatRecorder {
                     }
                 }
                 StreamStatus::Offline => {
-                    offline_time += self.config.check_interval;
+                    offline_time += self.get_check_interval().await;
                     if offline_time > long_offline_timeout {
                         self.status = StreamStatus::LongOffline;
                         // 只有当状态实际变化时才记录日志
@@ -565,13 +572,14 @@ impl StripChatRecorder {
                         {
                             return Ok(());
                         }
-                    } else if self
-                        .interruptible_sleep(tokio::time::Duration::from_secs(
-                            self.config.check_interval,
-                        ))
-                        .await
-                    {
-                        return Ok(());
+                    } else {
+                        let ci = self.get_check_interval().await;
+                        if self
+                            .interruptible_sleep(tokio::time::Duration::from_secs(ci))
+                            .await
+                        {
+                            return Ok(());
+                        }
                     }
                 }
                 StreamStatus::LongOffline => {

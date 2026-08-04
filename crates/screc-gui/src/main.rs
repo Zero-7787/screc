@@ -55,8 +55,6 @@ async fn main() -> Result<()> {
 
 /// GUI 模式入口：只使用配置文件运行
 async fn run_gui_mode(app_config: AppConfig, config_path: PathBuf) -> Result<()> {
-    let original_config_cookies = app_config.cookies.clone();
-
     // 初始化日志
     let log_level = if app_config.get_debug() {
         log::LevelFilter::Debug
@@ -131,11 +129,9 @@ async fn run_gui_mode(app_config: AppConfig, config_path: PathBuf) -> Result<()>
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let shared_app_config = Arc::new(Mutex::new(app_config));
     gui_state.set_app_config(shared_app_config.clone());
-    let shared_config_path = if config_path.exists() {
-        Some(config_path)
-    } else {
-        None
-    };
+    // 直接传 PathBuf，录制任务创建时再动态判断文件是否存在
+    // （首次运行无配置文件时，GUI 可能会先创建 config.json）
+    let shared_config_path = config_path;
 
     // 启动模特管理器（负责动态启停录制任务）
     let manager_handle = tokio::spawn(run_model_manager(
@@ -143,8 +139,6 @@ async fn run_gui_mode(app_config: AppConfig, config_path: PathBuf) -> Result<()>
         shutdown_rx,
         shared_app_config,
         shared_config_path,
-        original_config_cookies,
-        proxy_config,
         gui_state.clone(),
     ));
 
@@ -169,9 +163,7 @@ async fn run_model_manager(
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<ModelCommand>,
     mut shutdown_rx: broadcast::Receiver<()>,
     shared_app_config: Arc<Mutex<AppConfig>>,
-    shared_config_path: Option<PathBuf>,
-    original_config_cookies: Option<String>,
-    proxy_config: Option<ProxyConfig>,
+    shared_config_path: PathBuf,
     gui_state: SharedGuiState,
 ) {
     let mut active: HashMap<String, (broadcast::Sender<()>, tokio::task::JoinHandle<()>)> =
@@ -194,8 +186,6 @@ async fn run_model_manager(
                             username.clone(),
                             &shared_app_config,
                             &shared_config_path,
-                            &original_config_cookies,
-                            &proxy_config,
                             rx,
                             gui_state.clone(),
                         )
@@ -216,8 +206,6 @@ async fn run_model_manager(
                                 username.clone(),
                                 &shared_app_config,
                                 &shared_config_path,
-                                &original_config_cookies,
-                                &proxy_config,
                                 rx,
                                 gui_state.clone(),
                             )
@@ -246,8 +234,6 @@ async fn run_model_manager(
                                     username.clone(),
                                     &shared_app_config,
                                     &shared_config_path,
-                                    &original_config_cookies,
-                                    &proxy_config,
                                     rx,
                                     gui_state.clone(),
                                 )
@@ -295,16 +281,30 @@ async fn run_model_manager(
     }
 }
 
+/// 从共享配置动态读取代理配置（支持即时生效）
+/// 用户显式清空代理时返回 None（不启用代理）
+fn build_proxy_config(app_config: &AppConfig) -> Option<ProxyConfig> {
+    let proxy_url = app_config.get_proxy();
+    if proxy_url.as_deref().unwrap_or_default().trim().is_empty() {
+        return None;
+    }
+    ProxyConfig::from_options(
+        proxy_url,
+        app_config.get_proxy_username(),
+        app_config.get_proxy_password(),
+    )
+}
+
 /// 为 GUI 模式创建单个模特的录制任务
 async fn spawn_gui_recorder_task(
     username: String,
     shared_app_config: &Arc<Mutex<AppConfig>>,
-    shared_config_path: &Option<PathBuf>,
-    original_config_cookies: &Option<String>,
-    proxy_config: &Option<ProxyConfig>,
+    shared_config_path: &PathBuf,
     shutdown_rx: broadcast::Receiver<()>,
     gui_state: SharedGuiState,
 ) -> tokio::task::JoinHandle<()> {
+    // 动态读取最新代理配置（GUI 修改后即时生效）
+    let proxy_config = build_proxy_config(&*shared_app_config.lock().await);
     let config = Config::from_app_config(
         &*shared_app_config.lock().await,
         username.clone(),
@@ -316,8 +316,12 @@ async fn spawn_gui_recorder_task(
     info!("为用户 {} 创建录制任务", username);
 
     let shared_app_config_clone = shared_app_config.clone();
-    let shared_config_path_clone = shared_config_path.clone();
-    let original_config_cookies_clone = original_config_cookies.clone();
+    // 动态判断配置文件是否存在（首次运行 GUI 可能已创建 config.json）
+    let shared_config_path_clone = if shared_config_path.exists() {
+        Some(shared_config_path.clone())
+    } else {
+        None
+    };
 
     tokio::spawn(async move {
         match StripChatRecorder::new(
@@ -325,7 +329,6 @@ async fn spawn_gui_recorder_task(
             shared_app_config_clone,
             shared_config_path_clone,
             false,
-            original_config_cookies_clone,
         )
         .await
         {

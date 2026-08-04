@@ -121,16 +121,9 @@ async fn main() -> Result<()> {
     // 合并命令行参数
     let cli_args = CliArgs::from(&cli);
     let has_cli_cookies = cli_args.cookies.is_some();
-    let original_config_cookies = app_config.cookies.clone();
     app_config.merge_with_cli(&cli_args);
 
-    run_cli(
-        app_config,
-        config_path,
-        has_cli_cookies,
-        original_config_cookies,
-    )
-    .await
+    run_cli(app_config, config_path, has_cli_cookies).await
 }
 
 // ── CLI 专用逻辑 ──────────────────────────────────────────────────
@@ -140,7 +133,6 @@ async fn run_cli(
     app_config: AppConfig,
     config_path: PathBuf,
     has_cli_cookies: bool,
-    original_config_cookies: Option<String>,
 ) -> Result<()> {
     // 初始化日志
     let log_level = if app_config.get_debug() {
@@ -184,13 +176,8 @@ async fn run_cli(
 
     dispatch.apply().context("无法初始化日志系统")?;
 
-    let (mut tasks, shutdown_tx) = spawn_recording_tasks(
-        app_config,
-        config_path,
-        has_cli_cookies,
-        original_config_cookies,
-    )
-    .await?;
+    let (mut tasks, shutdown_tx) =
+        spawn_recording_tasks(app_config, config_path, has_cli_cookies).await?;
 
     // 等待所有任务完成或 Ctrl+C
     let mut all_tasks_completed = false;
@@ -254,7 +241,6 @@ async fn spawn_recording_tasks(
     app_config: AppConfig,
     config_path: PathBuf,
     has_cli_cookies: bool,
-    original_config_cookies: Option<String>,
 ) -> Result<(Vec<tokio::task::JoinHandle<()>>, broadcast::Sender<()>)> {
     let usernames = app_config.get_usernames()?;
 
@@ -318,14 +304,12 @@ async fn spawn_recording_tasks(
         let shutdown_rx = shutdown_tx.subscribe();
         let shared_app_config_clone = shared_app_config.clone();
         let shared_config_path_clone = shared_config_path.clone();
-        let original_config_cookies_clone = original_config_cookies.clone();
         let recorder_task = tokio::spawn(async move {
             match StripChatRecorder::new(
                 config,
                 shared_app_config_clone,
                 shared_config_path_clone,
                 has_cli_cookies,
-                original_config_cookies_clone,
             )
             .await
             {
